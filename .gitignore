@@ -1,0 +1,29 @@
+# macOS
+.DS_Store
+
+# Build products
+.build/
+build/
+DerivedData/
+*.app/
+*.dSYM/
+*.zip
+*.tar.xz
+*.swiftmodule
+*.swiftdoc
+*.swiftsourceinfo
+
+# Local reference checkout
+vendor/
+
+# Local/private project metadata
+Resources/Info.plist
+docs/
+
+# Local diagnostics and screenshots
+*.log
+*.trace
+*.xcresult/
+
+# User-machine backups
+*.before-prevdock-labels.plist
