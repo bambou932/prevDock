@@ -4,5 +4,17 @@
     <title>prevDock Updates</title>
     <description>Preview releases for prevDock.</description>
     <language>en</language>
+    <item>
+      <title>prevDock 0.1.0 Preview</title>
+      <pubDate>Sat, 23 May 2026 07:14:25 +0000</pubDate>
+      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <sparkle:releaseNotesLink>https://github.com/bambou932/prevDock/releases/tag/v0.1.0</sparkle:releaseNotesLink>
+      <enclosure
+        url="https://github.com/bambou932/prevDock/releases/download/v0.1.0/prevDock-0.1.0-arm64.zip"
+        sparkle:version="1"
+        sparkle:shortVersionString="0.1.0"
+        sparkle:edSignature="ME3yF7iRxXo5+nGcKj0AH26HWtt7PapisGqjWwnU0xYtdmJfbQe+0LzahjJo+PNk01CG14wMu1C3xsrtF1DkCw==" length="1412997"
+        type="application/octet-stream"/>
+    </item>
   </channel>
 </rss>
