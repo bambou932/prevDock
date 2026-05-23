@@ -8,6 +8,7 @@ GH_REPO="${PREVDOCK_GITHUB_REPO:-bambou932/prevDock}"
 TAP_REPO="${PREVDOCK_HOMEBREW_TAP:-bambou932/homebrew-prevdock}"
 TAP_DIR="${PREVDOCK_TAP_DIR:-$ROOT_DIR/../homebrew-prevdock}"
 NOTARY_PROFILE="${PREVDOCK_NOTARY_PROFILE:-prevdock-notary}"
+NOTARIZE="${PREVDOCK_NOTARIZE:-0}"
 SPARKLE_VERSION="2.9.2"
 SPARKLE_SIGN_UPDATE="$ROOT_DIR/.build/sparkle/$SPARKLE_VERSION/bin/sign_update"
 
@@ -38,6 +39,10 @@ ensure_clean_tree() {
   fi
 }
 
+should_notarize() {
+  [[ "$NOTARIZE" == "1" || "$NOTARIZE" == "true" || "$NOTARIZE" == "yes" ]]
+}
+
 developer_id_identity() {
   if [[ -n "${PREVDOCK_SIGNING_IDENTITY:-}" ]]; then
     echo "$PREVDOCK_SIGNING_IDENTITY"
@@ -52,11 +57,16 @@ developer_id_identity() {
 ensure_release_prerequisites() {
   require_command gh
   require_command git
-  require_command xcrun
   require_command shasum
   require_command ditto
 
   gh auth status >/dev/null
+  if ! should_notarize; then
+    echo "Publishing an unnotarized preview release. Users may need Control-click > Open or System Settings > Privacy & Security > Open Anyway." >&2
+    return
+  fi
+
+  require_command xcrun
 
   local identity
   identity="$(developer_id_identity)"
@@ -77,21 +87,28 @@ ensure_release_prerequisites() {
 release_notes_file() {
   local version="$1"
   local notes="$ROOT_DIR/docs/release-notes/v$version.md"
-  if [[ -f "$notes" ]]; then
+  if should_notarize && [[ -f "$notes" ]]; then
     echo "$notes"
     return
   fi
 
+  notes="$ROOT_DIR/build/release-notes/v$version.md"
   mkdir -p "$(dirname "$notes")"
   {
     echo "# prevDock $version Preview"
     echo
-    echo "Preview release for prevDock."
+    if should_notarize; then
+      echo "Preview release for prevDock."
+    else
+      echo "Unnotarized preview release for prevDock."
+      echo
+      echo "On first launch, macOS may require Control-click > Open or System Settings > Privacy & Security > Open Anyway."
+    fi
   } >"$notes"
   echo "$notes"
 }
 
-build_notarized_zip() {
+build_release_zip() {
   local version="$1"
   local app_dir
   local release_dir="$ROOT_DIR/build/release"
@@ -102,10 +119,12 @@ build_notarized_zip() {
 
   rm -rf "$release_dir"
   mkdir -p "$release_dir"
-  ditto -c -k --keepParent "$app_dir" "$notarization_zip"
-  xcrun notarytool submit "$notarization_zip" --keychain-profile "$NOTARY_PROFILE" --wait >&2
-  xcrun stapler staple "$app_dir" >&2
-  xcrun stapler validate "$app_dir" >&2
+  if should_notarize; then
+    ditto -c -k --keepParent "$app_dir" "$notarization_zip"
+    xcrun notarytool submit "$notarization_zip" --keychain-profile "$NOTARY_PROFILE" --wait >&2
+    xcrun stapler staple "$app_dir" >&2
+    xcrun stapler validate "$app_dir" >&2
+  fi
   ditto -c -k --keepParent "$app_dir" "$final_zip"
   echo "$final_zip"
 }
@@ -230,6 +249,17 @@ cask "prevdock" do
   zap trash: [
     "~/Library/Preferences/io.github.bambou932.prevDock.plist",
   ]
+
+  caveats <<~EOS
+    prevDock preview builds are not Apple-notarized yet.
+
+    If macOS blocks the first launch:
+      1. Open /Applications in Finder.
+      2. Control-click prevDock.app and choose Open.
+      3. Choose Open again.
+
+    You can also allow it from System Settings > Privacy & Security > Open Anyway.
+  EOS
 end
 CASK
 
@@ -266,13 +296,15 @@ main() {
 
   local notes zip_path signature sha256
   notes="$(release_notes_file "$version")"
-  zip_path="$(build_notarized_zip "$version")"
+  zip_path="$(build_release_zip "$version")"
   signature="$(sparkle_signature_attributes "$zip_path")"
   sha256="$(shasum -a 256 "$zip_path" | awk '{print $1}')"
   write_appcast "$version" "$zip_path" "$signature"
 
-  git add "$INFO_PLIST" "$APPCAST" "$notes"
-  git commit -m "Release v$version"
+  git add "$APPCAST"
+  if ! git diff --cached --quiet; then
+    git commit -m "Release v$version"
+  fi
   git tag -a "v$version" -m "prevDock $version"
   publish_github_release "$version" "$zip_path" "$notes"
   write_cask "$version" "$sha256"
