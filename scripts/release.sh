@@ -227,8 +227,7 @@ cask "prevdock" do
   version "$version"
   sha256 "$sha256"
 
-  url "https://github.com/bambou932/prevDock/releases/download/v#{version}/prevDock-#{version}-arm64.zip",
-      verified: "github.com/bambou932/prevDock/"
+  url "https://github.com/bambou932/prevDock/releases/download/v#{version}/prevDock-#{version}-arm64.zip"
   name "prevDock"
   desc "Dock hover window previews for macOS"
   homepage "https://github.com/bambou932/prevDock"
