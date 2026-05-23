@@ -52,9 +52,9 @@ After granting permissions, restart `prevDock` if macOS asks for it.
 
 ## Updates
 
-Open the menu bar icon, choose **Settings...**, then use **Check for Updates...** in the Updates section. prevDock uses Sparkle for in-app update checks and installs. The Homebrew cask is marked as auto-updating because Sparkle can update the app outside `brew upgrade`.
+Open the menu bar icon, choose **Settings...**, then use **Update Now...** in the Updates section. prevDock uses Sparkle to check for an update and continue into the download/install flow when an update is available. The Homebrew cask is marked as auto-updating because Sparkle can update the app outside `brew upgrade`.
 
-Automatic update checks are off by default for the preview release. You can enable them in Settings.
+Automatic update installation is off by default for the preview release. You can enable it in Settings.
 
 ## Release
 

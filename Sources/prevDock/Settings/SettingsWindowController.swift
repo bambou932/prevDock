@@ -70,7 +70,7 @@ private final class SettingsContentView: NSView {
     private let dockAppClickPreviewSwitch = NSSwitch()
     private let nativeDockLabelSuppressionSwitch = NSSwitch()
     private let automaticUpdateSwitch = NSSwitch()
-    private let updateCheckButton = NSButton(title: "Check for Updates...", target: nil, action: nil)
+    private let updateCheckButton = NSButton(title: "Update Now...", target: nil, action: nil)
     private let updateVersionLabel = NSTextField(labelWithString: "")
     private let updateController: UpdateController
 
@@ -403,8 +403,8 @@ private final class SettingsContentView: NSView {
         row.alignment = .centerY
         let automaticRow = makeSwitchSection(
             toggle: automaticUpdateSwitch,
-            title: "Automatically check for updates",
-            description: "Use Sparkle update checks."
+            title: "Automatically install updates",
+            description: "Check, download, and install preview updates."
         )
         return makeVerticalStack(views: [row, automaticRow], spacing: 10)
     }
@@ -528,7 +528,7 @@ private final class SettingsContentView: NSView {
     }
 
     @objc private func automaticUpdateChanged(_ sender: NSSwitch) {
-        updateController.automaticallyChecksForUpdates = sender.state == .on
+        updateController.automaticallyInstallsUpdates = sender.state == .on
         updateControls()
     }
 
@@ -608,7 +608,7 @@ private final class SettingsContentView: NSView {
     }
 
     private func updateUpdateControls() {
-        automaticUpdateSwitch.state = updateController.automaticallyChecksForUpdates ? .on : .off
+        automaticUpdateSwitch.state = updateController.automaticallyInstallsUpdates ? .on : .off
         updateCheckButton.isEnabled = updateController.canCheckForUpdates
         updateVersionLabel.stringValue = updateController.currentVersionText
     }

@@ -23,11 +23,37 @@ final class UpdateController: NSObject {
         }
     }
 
+    var automaticallyInstallsUpdates: Bool {
+        get {
+            updaterController.updater.automaticallyChecksForUpdates &&
+                updaterController.updater.automaticallyDownloadsUpdates
+        }
+        set {
+            if newValue {
+                updaterController.updater.automaticallyChecksForUpdates = true
+                guard updaterController.updater.allowsAutomaticUpdates else { return }
+                updaterController.updater.automaticallyDownloadsUpdates = true
+                return
+            }
+
+            if updaterController.updater.allowsAutomaticUpdates {
+                updaterController.updater.automaticallyDownloadsUpdates = false
+            }
+            updaterController.updater.automaticallyChecksForUpdates = false
+        }
+    }
+
     var canCheckForUpdates: Bool {
         updaterController.updater.canCheckForUpdates
     }
 
     @objc func checkForUpdates(_ sender: Any?) {
+        enableAutomaticInstallForThisCheck()
         updaterController.checkForUpdates(sender)
+    }
+
+    private func enableAutomaticInstallForThisCheck() {
+        guard updaterController.updater.allowsAutomaticUpdates else { return }
+        updaterController.updater.automaticallyDownloadsUpdates = true
     }
 }

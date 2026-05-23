@@ -55,7 +55,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ","))
         let updateItem = NSMenuItem(
-            title: "Check for Updates...",
+            title: "Update Now...",
             action: #selector(UpdateController.checkForUpdates(_:)),
             keyEquivalent: ""
         )
