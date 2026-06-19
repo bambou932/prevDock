@@ -42,5 +42,6 @@ Keep files near the feature that changes with them. Add a new folder only when a
 - Commit messages are free-form, but must not start with an author or tool prefix such as `Codex:`, `ChatGPT:`, `Assistant:`, `Agent:`, or the configured `git user.name`.
 - Before every commit, run `./scripts/build.sh`. If the build fails, do not commit.
 - Keep `main` buildable at all times. Changes should reach `main` through pull requests with the `build` check passing.
+- Merge pull requests into `main` with merge commits. Do not use squash merge or rebase merge unless the user explicitly asks for that exception.
 - Tags are release markers only. Create annotated SemVer tags like `v0.1.0` only after a successful build on `main`.
 - Use the repository Git author config. Do not override the author as Codex, ChatGPT, OpenAI, or any bot identity.
