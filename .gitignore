@@ -17,7 +17,6 @@ DerivedData/
 vendor/
 
 # Local/private project metadata
-Resources/Info.plist
 docs/
 
 # Local diagnostics and screenshots
