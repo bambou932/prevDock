@@ -21,3 +21,26 @@ Keep files near the feature that changes with them. Add a new folder only when a
 - Reuse AppKit objects where practical, coalesce capture work, and avoid broad polling or I/O on the main thread.
 - Preserve low latency around Dock hover, thumbnail refresh, and window focusing paths.
 
+## Git Workflow Rules
+
+- Run `git status --short --branch` before editing files.
+- Never make ordinary commits directly on `main` or `master`.
+- Do work on purpose-named branches using one of these prefixes:
+  - `feature/`
+  - `fix/`
+  - `hotfix/`
+  - `release/`
+  - `chore/`
+  - `docs/`
+  - `refactor/`
+  - `test/`
+  - `perf/`
+- Do not put the tool or author name in the branch prefix. Use `feature/settings-polish`, not `codex/feature-settings-polish`.
+- Keep branch descriptions lowercase and hyphen-separated, with dots only where useful for versions, such as `release/v0.2.0`.
+- Do not commit unless the user explicitly asks for a commit.
+- Stage only files related to the current task. Never stage unrelated user changes.
+- Commit messages are free-form, but must not start with an author or tool prefix such as `Codex:`, `ChatGPT:`, `Assistant:`, `Agent:`, or the configured `git user.name`.
+- Before every commit, run `./scripts/build.sh`. If the build fails, do not commit.
+- Keep `main` buildable at all times. Changes should reach `main` through pull requests with the `build` check passing.
+- Tags are release markers only. Create annotated SemVer tags like `v0.1.0` only after a successful build on `main`.
+- Use the repository Git author config. Do not override the author as Codex, ChatGPT, OpenAI, or any bot identity.

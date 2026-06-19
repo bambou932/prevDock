@@ -300,9 +300,9 @@ main() {
   sha256="$(shasum -a 256 "$zip_path" | awk '{print $1}')"
   write_appcast "$version" "$zip_path" "$signature"
 
-  git add "$APPCAST"
+  git add "$INFO_PLIST" "$APPCAST"
   if ! git diff --cached --quiet; then
-    git commit -m "Release v$version"
+    PREVDOCK_ALLOW_MAIN_RELEASE_COMMIT=1 git commit -m "Release v$version"
   fi
   git tag -a "v$version" -m "prevDock $version"
   publish_github_release "$version" "$zip_path" "$notes"

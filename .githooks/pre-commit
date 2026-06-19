@@ -1,0 +1,60 @@
+#!/bin/sh
+set -eu
+
+fail() {
+  echo "pre-commit: $*" >&2
+  exit 1
+}
+
+lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+blocked_identity() {
+  ident="$(lower "$1")"
+  case "$ident" in
+    *codex*|*chatgpt*|*openai*)
+      return 0
+      ;;
+  esac
+  return 1
+}
+
+valid_branch_name() {
+  printf '%s\n' "$1" |
+    LC_ALL=C grep -Eq '^(feature|fix|hotfix|release|chore|docs|refactor|test|perf)/[a-z0-9]+([.-][a-z0-9]+)*$'
+}
+
+release_main_commit_allowed() {
+  [ "${PREVDOCK_ALLOW_MAIN_RELEASE_COMMIT:-}" = "1" ] || return 1
+
+  changed_paths="$(git diff --cached --name-only)"
+  [ -n "$changed_paths" ] || fail "release commits must stage release metadata."
+
+  disallowed_paths="$(printf '%s\n' "$changed_paths" | LC_ALL=C grep -Ev '^(appcast\.xml|Resources/Info\.plist)$' || true)"
+  [ -z "$disallowed_paths" ] || fail "release main commit may only stage appcast.xml or Resources/Info.plist."
+}
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+branch="$(git symbolic-ref --quiet --short HEAD || true)"
+
+[ -n "$branch" ] || fail "detached HEAD commits are not allowed. Create a named task branch."
+
+if blocked_identity "$(git var GIT_AUTHOR_IDENT)"; then
+  fail "Git author identity looks like Codex/ChatGPT/OpenAI. Configure user.name and user.email."
+fi
+
+if blocked_identity "$(git var GIT_COMMITTER_IDENT)"; then
+  fail "Git committer identity looks like Codex/ChatGPT/OpenAI. Configure user.name and user.email."
+fi
+
+case "$branch" in
+  main|master)
+    release_main_commit_allowed || fail "ordinary commits on $branch are blocked. Use a task branch."
+    ;;
+  *)
+    valid_branch_name "$branch" || fail "branch must match feature/*, fix/*, hotfix/*, release/*, chore/*, docs/*, refactor/*, test/*, or perf/*."
+    ;;
+esac
+
+"$ROOT_DIR/scripts/build.sh"

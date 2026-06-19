@@ -1,0 +1,33 @@
+#!/bin/sh
+set -eu
+
+fail() {
+  echo "pre-push: $*" >&2
+  exit 1
+}
+
+valid_release_tag() {
+  printf '%s\n' "$1" | LC_ALL=C grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'
+}
+
+ROOT_DIR="$(git rev-parse --show-toplevel)"
+needs_build=0
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+  [ -n "${local_ref:-}" ] || continue
+
+  case "$remote_ref" in
+    refs/tags/*)
+      tag_name="${remote_ref#refs/tags/}"
+      valid_release_tag "$tag_name" || fail "release tags must use vX.Y.Z format."
+
+      object_type="$(git cat-file -t "$local_sha")"
+      [ "$object_type" = "tag" ] || fail "release tags must be annotated tags."
+      needs_build=1
+      ;;
+  esac
+done
+
+if [ "$needs_build" -eq 1 ]; then
+  "$ROOT_DIR/scripts/build.sh"
+fi

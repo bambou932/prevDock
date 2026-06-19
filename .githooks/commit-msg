@@ -1,0 +1,32 @@
+#!/bin/sh
+set -eu
+
+fail() {
+  echo "commit-msg: $*" >&2
+  exit 1
+}
+
+lower() {
+  printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
+}
+
+reject_author_prefix() {
+  name="$(lower "$1")"
+  [ -n "$name" ] || return 0
+
+  case "$first_line_lower" in
+    "$name":*|"$name - "*)
+      fail "commit message must not start with an author or tool prefix."
+      ;;
+  esac
+}
+
+first_line="$(sed -n '1p' "$1")"
+first_line_lower="$(lower "$first_line")"
+
+reject_author_prefix "Codex"
+reject_author_prefix "ChatGPT"
+reject_author_prefix "Assistant"
+reject_author_prefix "Agent"
+reject_author_prefix "OpenAI"
+reject_author_prefix "$(git config --get user.name || true)"
