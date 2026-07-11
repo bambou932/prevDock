@@ -6,9 +6,11 @@ final class DockMouseEventSuppressor {
     private var runLoopSource: CFRunLoopSource?
     private var rectRefreshTimer: Timer?
     var onSuppressedMouseMoved: (() -> Void)?
+    var shouldPassThroughMouseMoved: ((CGPoint) -> Bool)?
 
     var isRunning: Bool {
-        eventTap != nil
+        guard let eventTap else { return false }
+        return CFMachPortIsValid(eventTap) && CGEvent.tapIsEnabled(tap: eventTap)
     }
 
     func updateForCurrentSettings() {
@@ -20,10 +22,11 @@ final class DockMouseEventSuppressor {
     }
 
     func start() {
-        guard eventTap == nil else {
+        if isRunning {
             DockGeometryCache.shared.refreshNow()
             return
         }
+        stop()
 
         DockGeometryCache.shared.refreshNow()
         startRectRefreshTimer()
@@ -38,8 +41,6 @@ final class DockMouseEventSuppressor {
             callback: Self.eventCallback,
             userInfo: refcon
         ) else {
-            rectRefreshTimer?.invalidate()
-            rectRefreshTimer = nil
             NSLog("prevDock: failed to install Dock mouse event suppressor")
             return
         }
@@ -82,6 +83,7 @@ final class DockMouseEventSuppressor {
 
         let point = DockCursorTracker.shared.updateFromEventTap(quartzPoint: event.location)
         guard suppressor.isRunning,
+              suppressor.shouldPassThroughMouseMoved?(point) != true,
               DockGeometryCache.shared.isInNativeLabelSuppressionStrip(point, refreshIfStale: false) else {
             return Unmanaged.passUnretained(event)
         }
@@ -102,8 +104,13 @@ final class DockMouseEventSuppressor {
     }
 
     private func startRectRefreshTimer() {
-        let timer = Timer(timeInterval: 10, repeats: true) { _ in
+        let timer = Timer(timeInterval: 10, repeats: true) { [weak self] _ in
             DockGeometryCache.shared.refreshNow()
+            guard PrevDockSettings.nativeDockLabelSuppressionEnabled,
+                  self?.isRunning != true else {
+                return
+            }
+            self?.start()
         }
         rectRefreshTimer = timer
         RunLoop.main.add(timer, forMode: .common)

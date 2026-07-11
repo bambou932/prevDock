@@ -15,6 +15,8 @@ final class PreviewPanelController {
     private var currentSize = NSSize(width: 160, height: 48)
     private var currentAnchor = CGRect.zero
     private var initialHoverSuppressionPoint: CGPoint?
+    private var removalAnimationGeneration = 0
+    private var presentationGeneration = 0
 
     var isVisible: Bool {
         panel.isVisible
@@ -77,6 +79,9 @@ final class PreviewPanelController {
     }
 
     func show(previews: [WindowPreview], app: NSRunningApplication, anchoredTo anchor: CGRect) {
+        if !panel.isVisible || currentApp?.processIdentifier != app.processIdentifier {
+            presentationGeneration &+= 1
+        }
         let visiblePreviews = stabilizedPreviews(previews, app: app)
         let imageHeight = PreviewMetrics.imageHeight(anchoredTo: anchor)
         let overflowMode = PrevDockSettings.previewOverflowMode
@@ -159,6 +164,10 @@ final class PreviewPanelController {
     }
 
     func updateThumbnail(windowID: CGWindowID, image: NSImage, animated: Bool = true) {
+        guard PermissionManager.status.screenRecordingGranted else { return }
+        if let index = currentPreviews.firstIndex(where: { $0.windowID == windowID }) {
+            currentPreviews[index] = currentPreviews[index].replacingImage(with: image)
+        }
         cardsByWindowID[windowID]?.updateImage(image, animated: animated)
     }
 
@@ -168,8 +177,12 @@ final class PreviewPanelController {
     }
 
     func hide() {
-        guard panel.isVisible else { return }
+        if panel.isVisible {
+            presentationGeneration &+= 1
+        }
+        invalidateRemovalAnimation()
         WindowPeekController.shared.hide()
+        guard panel.isVisible else { return }
         panel.orderOut(nil)
     }
 
@@ -204,6 +217,7 @@ final class PreviewPanelController {
         overflowMode: PreviewOverflowMode,
         desktopGroupingEnabled: Bool
     ) {
+        invalidateRemovalAnimation()
         let mouse = DockCursorTracker.shared.currentMouseLocation(preferEventTap: true)
         initialHoverSuppressionPoint = contains(mouse) ? nil : mouse
         clearStack()
@@ -620,8 +634,12 @@ final class PreviewPanelController {
         )
     }
 
-    private func removePreview(windowID: CGWindowID) {
-        guard let app = currentApp else { return }
+    private func removePreview(windowID: CGWindowID, appPID: pid_t) {
+        guard let app = currentApp,
+              app.processIdentifier == appPID,
+              currentPreviews.contains(where: { $0.windowID == windowID }) else {
+            return
+        }
         let nextPreviews = currentPreviews.filter { $0.windowID != windowID }
         animateRemoval(
             windowIDs: [windowID],
@@ -668,6 +686,8 @@ final class PreviewPanelController {
         overflowMode: PreviewOverflowMode,
         desktopGroupingEnabled: Bool
     ) {
+        removalAnimationGeneration += 1
+        let generation = removalAnimationGeneration
         let duration = 0.16
         let existingCards = windowIDs.compactMap { cardsByWindowID[$0] }
         guard !existingCards.isEmpty else {
@@ -682,8 +702,14 @@ final class PreviewPanelController {
             return
         }
 
-        currentPreviews = nextPreviews
-        WindowPeekController.shared.hide()
+        updateCurrentPresentation(
+            previews: nextPreviews,
+            app: app,
+            anchor: anchor,
+            imageHeight: imageHeight,
+            overflowMode: overflowMode,
+            desktopGroupingEnabled: desktopGroupingEnabled
+        )
         existingCards.forEach { $0.collapseForRemoval(duration: duration) }
         windowIDs.forEach { cardsByWindowID.removeValue(forKey: $0) }
 
@@ -703,16 +729,25 @@ final class PreviewPanelController {
         }
 
         DispatchQueue.main.asyncAfter(deadline: .now() + duration + 0.02) { [weak self] in
-            guard let self, self.panel.isVisible else { return }
+            guard let self,
+                  self.panel.isVisible,
+                  self.removalAnimationGeneration == generation else {
+                return
+            }
+            guard let currentApp = self.currentApp else { return }
             self.render(
-                previews: nextPreviews,
-                app: app,
-                anchoredTo: anchor,
-                imageHeight: imageHeight,
-                overflowMode: overflowMode,
-                desktopGroupingEnabled: desktopGroupingEnabled
+                previews: self.currentPreviews,
+                app: currentApp,
+                anchoredTo: self.currentAnchor,
+                imageHeight: self.currentImageHeight,
+                overflowMode: self.currentOverflowMode,
+                desktopGroupingEnabled: self.currentDesktopGroupingEnabled
             )
         }
+    }
+
+    private func invalidateRemovalAnimation() {
+        removalAnimationGeneration += 1
     }
 
     private func layoutRows(for previews: [WindowPreview], anchoredTo anchor: CGRect, imageHeight: CGFloat) -> [[WindowPreview]] {
@@ -795,7 +830,10 @@ final class PreviewPanelController {
         let panelChrome = PreviewMetrics.panelPadding * 2
         if previews.isEmpty {
             let emptySize = EmptyPreviewView(appName: app.localizedName ?? "Application").intrinsicContentSize
-            return NSSize(width: emptySize.width + panelChrome, height: emptySize.height + panelChrome)
+            return NSSize(
+                width: min(emptySize.width + panelChrome, maxPanelWidth(anchoredTo: anchor)),
+                height: emptySize.height + panelChrome
+            )
         }
         if let groups = desktopGroups(for: previews, enabled: desktopGroupingEnabled, anchoredTo: anchor) {
             return groupedMeasuredSize(groups: groups, anchoredTo: anchor, imageHeight: imageHeight, overflowMode: overflowMode)
@@ -863,7 +901,7 @@ final class PreviewPanelController {
     }
 
     private func displayIdentifier(anchoredTo anchor: CGRect) -> String? {
-        let screen = NSScreen.screens.first { $0.frame.intersects(anchor) } ?? NSScreen.main
+        let screen = ScreenGeometry.screen(containing: anchor) ?? NSScreen.main
         guard let displayID = screen?.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber,
               let uuid = CGDisplayCreateUUIDFromDisplayID(displayID.uint32Value)?.takeRetainedValue() else {
             return nil
@@ -1126,26 +1164,48 @@ final class PreviewPanelController {
     }
 
     private func makeCard(for preview: WindowPreview, imageHeight: CGFloat) -> PreviewCardView {
+        let cardPresentationGeneration = presentationGeneration
         let card = PreviewCardView(
             preview: preview,
             imageHeight: imageHeight,
-            initialHoverSuppressionPoint: initialHoverSuppressionPoint
-        ) { [weak self] preview, completion in
-            WindowInventory.closeWindow(
-                windowID: preview.windowID,
-                app: preview.app,
-                isFullscreen: preview.isFullscreen
-            ) { success in
-                DispatchQueue.main.async {
+            initialHoverSuppressionPoint: initialHoverSuppressionPoint,
+            onFocus: { [weak self] preview, completion in
+                WindowInventory.focusWindow(
+                    windowID: preview.windowID,
+                    app: preview.app
+                ) { success in
                     guard success else {
                         completion(false)
                         return
                     }
-                    self?.removePreview(windowID: preview.windowID)
+                    let isStillPresented = self?.currentApp?.processIdentifier ==
+                        preview.app.processIdentifier &&
+                        self?.currentPreviews.contains(where: { $0.windowID == preview.windowID }) == true &&
+                        self?.presentationGeneration == cardPresentationGeneration
+                    if isStillPresented {
+                        self?.hide()
+                    }
                     completion(true)
                 }
+            },
+            onClose: { [weak self] preview, completion in
+                let appPID = preview.app.processIdentifier
+                WindowInventory.closeWindow(
+                    windowID: preview.windowID,
+                    app: preview.app,
+                    isFullscreen: preview.isFullscreen
+                ) { success in
+                    DispatchQueue.main.async {
+                        guard success else {
+                            completion(false)
+                            return
+                        }
+                        self?.removePreview(windowID: preview.windowID, appPID: appPID)
+                        completion(true)
+                    }
+                }
             }
-        }
+        )
         cardsByWindowID[preview.windowID] = card
         return card
     }
@@ -1197,7 +1257,7 @@ final class PreviewPanelController {
     }
 
     private func maxPanelWidth(anchoredTo anchor: CGRect) -> CGFloat {
-        let screen = NSScreen.screens.first { $0.frame.intersects(anchor) } ?? NSScreen.main
+        let screen = ScreenGeometry.screen(containing: anchor) ?? NSScreen.main
         let frame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         return max(260, frame.width - 20)
     }
@@ -1207,7 +1267,7 @@ final class PreviewPanelController {
     }
 
     private func positionedFrame(width: CGFloat, height: CGFloat, anchoredTo anchor: CGRect) -> NSRect {
-        let screen = NSScreen.screens.first { $0.frame.intersects(anchor) } ?? NSScreen.main
+        let screen = ScreenGeometry.screen(containing: anchor) ?? NSScreen.main
         let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
         let frame = screen?.visibleFrame ?? screenFrame
         let edge = dockEdge(for: anchor, in: screenFrame)

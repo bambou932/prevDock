@@ -53,10 +53,11 @@ final class DockLabelPanelController {
     }
 
     private func positionedFrame(size: NSSize, anchoredTo anchor: CGRect) -> NSRect {
-        let screen = NSScreen.screens.first { $0.frame.intersects(anchor) } ?? NSScreen.main
-        let frame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let screen = ScreenGeometry.screen(containing: anchor) ?? NSScreen.main
+        let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let frame = screen?.visibleFrame ?? screenFrame
         let gap: CGFloat = 7
-        let edge = dockEdge(for: anchor, in: frame)
+        let edge = dockEdge(for: anchor, in: screenFrame)
 
         switch edge {
         case .bottom:

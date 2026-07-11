@@ -2,10 +2,6 @@ import ApplicationServices
 import Cocoa
 
 enum AccessibilityHelpers {
-    static var globalDisplayMaxY: CGFloat {
-        NSScreen.screens.map(\.frame.maxY).max() ?? (NSScreen.main?.frame.height ?? 0)
-    }
-
     static func stringAttribute(_ element: AXUIElement, _ attribute: CFString) -> String? {
         var value: CFTypeRef?
         guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else { return nil }
@@ -62,19 +58,29 @@ enum AccessibilityHelpers {
     }
 
     static func accessibilityPoint(fromAppKitPoint point: CGPoint) -> CGPoint {
-        CGPoint(x: point.x, y: globalDisplayMaxY - point.y)
+        CGPoint(x: point.x, y: ScreenGeometry.appKitReferenceMaxY - point.y)
     }
 
     static func appKitPoint(fromQuartzPoint point: CGPoint) -> CGPoint {
-        CGPoint(x: point.x, y: globalDisplayMaxY - point.y)
+        CGPoint(x: point.x, y: ScreenGeometry.appKitReferenceMaxY - point.y)
     }
 
     static func appKitRect(fromAccessibilityPosition position: CGPoint, size: CGSize) -> CGRect {
-        CGRect(x: position.x, y: globalDisplayMaxY - position.y - size.height, width: size.width, height: size.height)
+        CGRect(
+            x: position.x,
+            y: ScreenGeometry.appKitReferenceMaxY - position.y - size.height,
+            width: size.width,
+            height: size.height
+        )
     }
 
     static func appKitFrame(fromQuartzWindowBounds bounds: CGRect) -> CGRect {
-        CGRect(x: bounds.minX, y: globalDisplayMaxY - bounds.maxY, width: bounds.width, height: bounds.height)
+        CGRect(
+            x: bounds.minX,
+            y: ScreenGeometry.appKitReferenceMaxY - bounds.maxY,
+            width: bounds.width,
+            height: bounds.height
+        )
     }
 }
 

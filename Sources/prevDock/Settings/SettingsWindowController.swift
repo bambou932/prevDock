@@ -1,8 +1,15 @@
 import Cocoa
 
 final class SettingsWindowController: NSWindowController {
+    private let settingsContentView: SettingsContentView
+
+    var isVisible: Bool {
+        window?.isVisible == true
+    }
+
     init(updateController: UpdateController) {
         let contentView = SettingsContentView(updateController: updateController)
+        settingsContentView = contentView
         let window = NSWindow(
             contentRect: NSRect(x: 0, y: 0, width: 952, height: 700),
             styleMask: [.titled, .closable, .miniaturizable],
@@ -23,7 +30,16 @@ final class SettingsWindowController: NSWindowController {
     }
 
     func showSettings() {
+        showSettings(focusingPermissions: false)
+    }
+
+    func showPermissionSettings() {
+        showSettings(focusingPermissions: true)
+    }
+
+    private func showSettings(focusingPermissions: Bool) {
         guard let window else { return }
+        settingsContentView.refreshForPresentation()
 
         if window.isMiniaturized {
             window.deminiaturize(nil)
@@ -34,6 +50,9 @@ final class SettingsWindowController: NSWindowController {
         DispatchQueue.main.async { [weak self, weak window] in
             guard let self, let window else { return }
             self.focusWindow(window)
+            if focusingPermissions {
+                self.settingsContentView.focusPermissionSection()
+            }
         }
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.08) { [weak self, weak window] in
             guard let self, let window, !window.isKeyWindow else { return }
@@ -55,6 +74,7 @@ private final class SettingsContentView: NSView {
     private static let closeOptionButtonSize = NSSize(width: 424, height: 238)
     private let scrollView = NSScrollView()
     private let documentView = NSView()
+    private let permissionSettingsView = PermissionSettingsView()
     private let delaySlider = NSSlider()
     private let delayStepper = NSStepper()
     private let delayValueLabel = NSTextField(labelWithString: "")
@@ -77,6 +97,9 @@ private final class SettingsContentView: NSView {
     init(updateController: UpdateController) {
         self.updateController = updateController
         super.init(frame: .zero)
+        updateController.stateDidChange = { [weak self] in
+            self?.updateUpdateControls()
+        }
         build()
         updateControls()
     }
@@ -94,6 +117,17 @@ private final class SettingsContentView: NSView {
         DispatchQueue.main.async { [weak self] in
             self?.scrollToTop()
         }
+    }
+
+    func refreshForPresentation() {
+        updateControls()
+        permissionSettingsView.refreshForPresentation()
+    }
+
+    func focusPermissionSection() {
+        layoutSubtreeIfNeeded()
+        scrollToTop()
+        permissionSettingsView.focusFirstRelevantAction()
     }
 
     private func build() {
@@ -148,12 +182,14 @@ private final class SettingsContentView: NSView {
         delaySlider.isContinuous = true
         delaySlider.target = self
         delaySlider.action = #selector(delayChanged(_:))
+        delaySlider.setAccessibilityLabel("Preview switch delay")
         delaySlider.widthAnchor.constraint(equalToConstant: Self.settingsSliderWidth).isActive = true
         delayStepper.minValue = PrevDockSettings.previewSwitchDelayRange.lowerBound
         delayStepper.maxValue = PrevDockSettings.previewSwitchDelayRange.upperBound
         delayStepper.increment = 0.05
         delayStepper.target = self
         delayStepper.action = #selector(delayChanged(_:))
+        delayStepper.setAccessibilityLabel("Preview switch delay")
         delayValueLabel.font = .monospacedDigitSystemFont(ofSize: 13, weight: .medium)
         delayValueLabel.textColor = .labelColor
         delayValueLabel.alignment = .right
@@ -167,6 +203,7 @@ private final class SettingsContentView: NSView {
         contentSizeSlider.allowsTickMarkValuesOnly = true
         contentSizeSlider.target = self
         contentSizeSlider.action = #selector(contentSizeChanged(_:))
+        contentSizeSlider.setAccessibilityLabel("Preview title size")
         contentSizeSlider.widthAnchor.constraint(equalToConstant: Self.settingsSliderWidth).isActive = true
         contentSizeValueLabel.font = .systemFont(ofSize: 12, weight: .medium)
         contentSizeValueLabel.textColor = .secondaryLabelColor
@@ -181,6 +218,7 @@ private final class SettingsContentView: NSView {
         windowHeightSlider.allowsTickMarkValuesOnly = true
         windowHeightSlider.target = self
         windowHeightSlider.action = #selector(windowHeightChanged(_:))
+        windowHeightSlider.setAccessibilityLabel("Preview window height")
         windowHeightSlider.widthAnchor.constraint(equalToConstant: Self.settingsSliderWidth).isActive = true
         windowHeightValueLabel.font = .systemFont(ofSize: 12, weight: .medium)
         windowHeightValueLabel.textColor = .secondaryLabelColor
@@ -192,6 +230,8 @@ private final class SettingsContentView: NSView {
         let group = SettingsGroupView()
         let stack = makeVerticalStack(
             views: [
+                permissionSettingsView,
+                separator(),
                 makeDelaySection(),
                 separator(),
                 makeOverflowSection(),
@@ -216,6 +256,7 @@ private final class SettingsContentView: NSView {
         stack.translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             group.widthAnchor.constraint(equalToConstant: Self.settingsGroupWidth),
+            permissionSettingsView.widthAnchor.constraint(equalTo: stack.widthAnchor),
             stack.leadingAnchor.constraint(equalTo: group.leadingAnchor, constant: 16),
             stack.trailingAnchor.constraint(equalTo: group.trailingAnchor, constant: -16),
             stack.topAnchor.constraint(equalTo: group.topAnchor, constant: 16),
@@ -365,7 +406,7 @@ private final class SettingsContentView: NSView {
         makeSwitchSection(
             toggle: dockAppClickPreviewSwitch,
             title: "Dock app click previews",
-            description: "Show previews on Dock click."
+            description: "Show previews on a plain click. Hold Shift for native Dock drag and modifier actions."
         )
     }
 
@@ -417,6 +458,7 @@ private final class SettingsContentView: NSView {
     }
 
     private func makeSwitchSection(toggle: NSSwitch, title: String, description: String) -> NSStackView {
+        toggle.setAccessibilityLabel(title)
         let labelStack = makeSectionLabel(
             title: title,
             description: description
@@ -541,7 +583,10 @@ private final class SettingsContentView: NSView {
         let delay = PrevDockSettings.previewSwitchDelay
         delaySlider.doubleValue = delay
         delayStepper.doubleValue = delay
-        delayValueLabel.stringValue = PrevDockSettings.formattedDelay(delay)
+        let delayDescription = PrevDockSettings.formattedDelay(delay)
+        delayValueLabel.stringValue = delayDescription
+        delaySlider.setAccessibilityValueDescription(delayDescription)
+        delayStepper.setAccessibilityValueDescription(delayDescription)
         updateOverflowButtons()
         updateContentSizeControls()
         updateCloseButtons()
@@ -564,10 +609,12 @@ private final class SettingsContentView: NSView {
         let index = PreviewContentSize.allCases.firstIndex(of: selected) ?? 0
         contentSizeSlider.doubleValue = Double(index)
         contentSizeValueLabel.stringValue = selected.title
+        contentSizeSlider.setAccessibilityValueDescription(selected.title)
         let height = PrevDockSettings.previewWindowHeight
         let heightIndex = PreviewWindowHeight.allCases.firstIndex(of: height) ?? 0
         windowHeightSlider.doubleValue = Double(heightIndex)
         windowHeightValueLabel.stringValue = height.title
+        windowHeightSlider.setAccessibilityValueDescription(height.title)
         contentSizeSample.update()
     }
 
@@ -663,6 +710,7 @@ private final class SettingsPreviewOptionButton: NSButton {
 
     var isChosen = false {
         didSet {
+            state = isChosen ? .on : .off
             updateSampleState()
         }
     }
@@ -735,14 +783,27 @@ private final class SettingsPreviewOptionButton: NSButton {
 
     override func draw(_ dirtyRect: NSRect) {
         drawCaption()
+        drawKeyboardFocusIfNeeded()
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        let accepted = super.becomeFirstResponder()
+        if accepted { needsDisplay = true }
+        return accepted
+    }
+
+    override func resignFirstResponder() -> Bool {
+        let resigned = super.resignFirstResponder()
+        if resigned { needsDisplay = true }
+        return resigned
     }
 
     private func configureButton() {
-        setButtonType(.momentaryChange)
+        setButtonType(.radio)
         isBordered = false
         title = ""
         setAccessibilityLabel(caption)
-        setAccessibilityRole(.button)
+        state = isChosen ? .on : .off
         translatesAutoresizingMaskIntoConstraints = false
         widthAnchor.constraint(equalToConstant: cardSize.width).isActive = true
         heightAnchor.constraint(equalToConstant: cardSize.height).isActive = true
@@ -786,6 +847,18 @@ private final class SettingsPreviewOptionButton: NSButton {
             in: NSRect(x: 10, y: bounds.height - Self.captionHeight + 6, width: bounds.width - 20, height: 18),
             withAttributes: attributes
         )
+    }
+
+    private func drawKeyboardFocusIfNeeded() {
+        guard window?.firstResponder === self else { return }
+        let path = NSBezierPath(
+            roundedRect: bounds.insetBy(dx: 2, dy: 2),
+            xRadius: 10,
+            yRadius: 10
+        )
+        path.lineWidth = 2
+        NSColor.keyboardFocusIndicatorColor.setStroke()
+        path.stroke()
     }
 }
 

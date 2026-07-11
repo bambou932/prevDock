@@ -89,7 +89,7 @@ enum PreviewMetrics {
         anchoredTo anchor: CGRect,
         windowHeight: PreviewWindowHeight = PrevDockSettings.previewWindowHeight
     ) -> CGFloat {
-        let screen = NSScreen.screens.first { $0.frame.intersects(anchor) } ?? NSScreen.main
+        let screen = ScreenGeometry.screen(containing: anchor) ?? NSScreen.main
         let screenHeight = screen?.frame.height ?? 1080
         let baseHeight = clamp(screenHeight * 0.15, min: 128, max: 260)
         let scaledHeight = baseHeight * windowHeight.scale
@@ -298,6 +298,7 @@ final class PreviewCardView: NSView {
     private let keepsSampleCloseButtonVisible: Bool
     private let contentStyle: PreviewContentStyle
     private let interactionMode: InteractionMode
+    private let onFocus: (WindowPreview, @escaping (Bool) -> Void) -> Void
     private let onClose: (WindowPreview, @escaping (Bool) -> Void) -> Void
     private let imageView = NSImageView()
     private let appIconView = NSImageView()
@@ -307,6 +308,8 @@ final class PreviewCardView: NSView {
     private var widthConstraint: NSLayoutConstraint?
     private var peekWorkItem: DispatchWorkItem?
     private var hoverExitWorkItem: DispatchWorkItem?
+    private var actionFeedbackWorkItem: DispatchWorkItem?
+    private var actionFeedbackGeneration = 0
     private var isClosing = false
     private var isHovered = false
     private var initialHoverGate: InitialHoverActivationGate
@@ -320,6 +323,9 @@ final class PreviewCardView: NSView {
         contentSizeOverride: PreviewContentSize? = nil,
         showsCloseButtonOverride: Bool? = nil,
         initialHoverSuppressionPoint: CGPoint? = nil,
+        onFocus: @escaping (WindowPreview, @escaping (Bool) -> Void) -> Void = { _, completion in
+            completion(false)
+        },
         onClose: @escaping (WindowPreview, @escaping (Bool) -> Void) -> Void = { _, completion in completion(false) }
     ) {
         let thumbnailSize = Self.thumbnailSize(for: preview, imageHeight: imageHeight)
@@ -330,6 +336,7 @@ final class PreviewCardView: NSView {
         keepsSampleCloseButtonVisible = interactionMode == .sample && self.showsCloseButton
         self.contentStyle = contentStyle
         self.interactionMode = interactionMode
+        self.onFocus = onFocus
         self.onClose = onClose
         self.cardSize = Self.cardSize(thumbnailSize: thumbnailSize, contentStyle: contentStyle)
         self.initialHoverGate = InitialHoverActivationGate(suppressionPoint: initialHoverSuppressionPoint)
@@ -344,6 +351,7 @@ final class PreviewCardView: NSView {
     deinit {
         peekWorkItem?.cancel()
         hoverExitWorkItem?.cancel()
+        actionFeedbackWorkItem?.cancel()
         if isInteractive {
             WindowPeekController.shared.hide(windowID: preview.windowID)
         }
@@ -387,10 +395,15 @@ final class PreviewCardView: NSView {
 
     override func mouseDown(with event: NSEvent) {
         guard isInteractive, !isClosing else { return }
+        beginAction(status: "Opening")
         peekWorkItem?.cancel()
         WindowPeekController.shared.hide()
-        window?.orderOut(nil)
-        WindowInventory.focusWindow(windowID: preview.windowID, app: preview.app)
+        onFocus(preview) { [weak self] success in
+            guard let self else { return }
+            guard !success else { return }
+            self.isClosing = false
+            self.showActionFailure("Open failed")
+        }
     }
 
     override func updateTrackingAreas() {
@@ -417,6 +430,7 @@ final class PreviewCardView: NSView {
     }
 
     func updateImage(_ image: NSImage, animated: Bool = true) {
+        preview = preview.replacingImage(with: image)
         if let currentImage = imageView.image, currentImage === image {
             updateImageBackground()
             return
@@ -433,11 +447,16 @@ final class PreviewCardView: NSView {
     func updatePreview(_ preview: WindowPreview) {
         self.preview = preview
         titleLabel?.stringValue = preview.title
-        statusLabel?.stringValue = preview.isMinimized ? "Minimized" : ""
+        if !isClosing, actionFeedbackWorkItem == nil {
+            setStatus(preview.isMinimized ? "Minimized" : "")
+        }
         if let image = preview.image {
             updateImage(image)
         } else {
             updateImageBackground()
+        }
+        if isHovered, !isClosing {
+            WindowPeekController.shared.show(preview: preview)
         }
     }
 
@@ -451,19 +470,59 @@ final class PreviewCardView: NSView {
 
     @objc private func closeWindow(_ sender: NSButton) {
         guard isInteractive, !isClosing else { return }
+        beginAction(status: "Closing")
         peekWorkItem?.cancel()
         WindowPeekController.shared.hide()
         sender.isEnabled = false
         onClose(preview) { [weak self] success in
             guard let self, !success else { return }
+            self.isClosing = false
             self.closeButton.isEnabled = true
+            self.showActionFailure("Close failed")
         }
+    }
+
+    private func beginAction(status: String) {
+        isClosing = true
+        actionFeedbackGeneration += 1
+        actionFeedbackWorkItem?.cancel()
+        actionFeedbackWorkItem = nil
+        setStatus(status)
+    }
+
+    private func showActionFailure(_ message: String) {
+        setStatus(message)
+        actionFeedbackGeneration += 1
+        let generation = actionFeedbackGeneration
+        actionFeedbackWorkItem?.cancel()
+        let windowID = preview.windowID
+        let item = DispatchWorkItem { [weak self] in
+            guard let self,
+                  self.preview.windowID == windowID,
+                  self.actionFeedbackGeneration == generation,
+                  !self.isClosing else {
+                return
+            }
+            self.actionFeedbackWorkItem = nil
+            self.setStatus(self.preview.isMinimized ? "Minimized" : "")
+        }
+        actionFeedbackWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5, execute: item)
+    }
+
+    private func setStatus(_ status: String) {
+        guard let statusLabel, statusLabel.stringValue != status else { return }
+        statusLabel.stringValue = status
+        statusLabel.toolTip = status.isEmpty ? nil : status
+        NSAccessibility.post(element: statusLabel, notification: .valueChanged)
     }
 
     func collapseForRemoval(duration: TimeInterval) {
         isClosing = true
+        actionFeedbackGeneration += 1
         peekWorkItem?.cancel()
         hoverExitWorkItem?.cancel()
+        actionFeedbackWorkItem?.cancel()
         WindowPeekController.shared.hide(windowID: preview.windowID)
         PreviewCardHoverCoordinator.shared.deactivate(self)
         setCloseButtonVisible(false)
@@ -697,6 +756,8 @@ final class PreviewCardView: NSView {
         status.font = .systemFont(ofSize: contentStyle.statusFontSize, weight: .medium)
         status.textColor = NSColor.white.withAlphaComponent(0.7)
         status.alignment = .right
+        status.lineBreakMode = .byTruncatingTail
+        status.maximumNumberOfLines = 1
         return status
     }
 
