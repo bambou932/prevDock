@@ -361,6 +361,10 @@ final class PreviewCardView: NSView {
         cardSize
     }
 
+    var canReuseForPresentation: Bool {
+        !isClosing
+    }
+
     static func cardSize(for preview: WindowPreview, imageHeight: CGFloat) -> NSSize {
         cardSize(
             thumbnailSize: thumbnailSize(for: preview, imageHeight: imageHeight),
@@ -453,10 +457,24 @@ final class PreviewCardView: NSView {
         if let image = preview.image {
             updateImage(image)
         } else {
+            imageView.image = nil
+            imageView.subviews.forEach { $0.removeFromSuperview() }
             updateImageBackground()
+            updateHighlightCornerRadius(for: nil)
         }
         if isHovered, !isClosing {
             WindowPeekController.shared.show(preview: preview)
+        }
+    }
+
+    func prepareForPanelPresentation(initialHoverSuppressionPoint: CGPoint?) {
+        peekWorkItem?.cancel()
+        hoverExitWorkItem?.cancel()
+        initialHoverGate = InitialHoverActivationGate(
+            suppressionPoint: initialHoverSuppressionPoint
+        )
+        if isHovered {
+            deactivateHover()
         }
     }
 

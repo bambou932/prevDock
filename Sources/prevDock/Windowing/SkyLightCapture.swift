@@ -57,9 +57,13 @@ enum SkyLightCapture {
     }
 
     static func spaceIDs(windowID: CGWindowID) -> [UInt64] {
+        spaceIDsIfAvailable(windowID: windowID) ?? []
+    }
+
+    static func spaceIDsIfAvailable(windowID: CGWindowID) -> [UInt64]? {
         let windows = [NSNumber(value: windowID)] as CFArray
         let mask: CGSSpaceMask = [.current, .others, .user]
-        guard let result = CGSCopySpacesForWindows(skyLightConnection, mask, windows) else { return [] }
+        guard let result = CGSCopySpacesForWindows(skyLightConnection, mask, windows) else { return nil }
         let spaces = result.takeRetainedValue() as NSArray
         return spaces.compactMap { ($0 as? NSNumber)?.uint64Value }
     }

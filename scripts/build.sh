@@ -20,6 +20,10 @@ SPARKLE_SHA256="1cb340cbbef04c6c0d162078610c25e2221031d794a3449d89f2f56f4df77c95
 SPARKLE_DIR="$ROOT_DIR/.build/sparkle/$SPARKLE_VERSION"
 SPARKLE_FRAMEWORK="$SPARKLE_DIR/Sparkle.framework"
 
+"$ROOT_DIR/scripts/test-remote-window-cache.sh" >&2
+"$ROOT_DIR/scripts/test-window-refresh-coordinator.sh" >&2
+"$ROOT_DIR/scripts/test-window-space-membership.sh" >&2
+
 ensure_sparkle() {
   if [[ -d "$SPARKLE_FRAMEWORK" ]]; then
     return

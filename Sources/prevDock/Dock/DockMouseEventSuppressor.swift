@@ -74,6 +74,7 @@ final class DockMouseEventSuppressor {
             if let tap = suppressor.eventTap {
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
+            suppressor.notifySuppressedMouseMoved()
             return Unmanaged.passUnretained(event)
         }
 

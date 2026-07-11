@@ -13,11 +13,15 @@ final class DockCursorTracker {
     @discardableResult
     func updateFromEventTap(quartzPoint: CGPoint) -> CGPoint {
         let point = AccessibilityHelpers.appKitPoint(fromQuartzPoint: quartzPoint)
+        updateFromAppKitPoint(point)
+        return point
+    }
+
+    func updateFromAppKitPoint(_ point: CGPoint) {
         lock.lock()
         eventTapMouseLocation = point
         eventTapMouseLocationUpdatedAt = ProcessInfo.processInfo.systemUptime
         lock.unlock()
-        return point
     }
 
     func currentMouseLocation(preferEventTap: Bool = false) -> CGPoint {

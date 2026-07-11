@@ -41,6 +41,7 @@ final class PreviewPanelController {
         panel.collectionBehavior = [.canJoinAllSpaces, .transient, .ignoresCycle]
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
+        panel.title = "prevDock.preview.idle"
 
         contentView.wantsLayer = true
         contentView.layer?.cornerRadius = 12
@@ -82,6 +83,7 @@ final class PreviewPanelController {
         if !panel.isVisible || currentApp?.processIdentifier != app.processIdentifier {
             presentationGeneration &+= 1
         }
+        panel.title = "prevDock.preview.\(app.processIdentifier).\(presentationGeneration)"
         let visiblePreviews = stabilizedPreviews(previews, app: app)
         let imageHeight = PreviewMetrics.imageHeight(anchoredTo: anchor)
         let overflowMode = PrevDockSettings.previewOverflowMode
@@ -164,7 +166,6 @@ final class PreviewPanelController {
     }
 
     func updateThumbnail(windowID: CGWindowID, image: NSImage, animated: Bool = true) {
-        guard PermissionManager.status.screenRecordingGranted else { return }
         if let index = currentPreviews.firstIndex(where: { $0.windowID == windowID }) {
             currentPreviews[index] = currentPreviews[index].replacingImage(with: image)
         }
@@ -258,13 +259,12 @@ final class PreviewPanelController {
         overflowMode: PreviewOverflowMode,
         desktopGroupingEnabled: Bool
     ) -> Bool {
-        guard panel.isVisible,
-              currentApp?.processIdentifier == app.processIdentifier,
+        guard currentApp?.processIdentifier == app.processIdentifier,
               currentOverflowMode == overflowMode,
               currentDesktopGroupingEnabled == desktopGroupingEnabled,
               abs(currentImageHeight - imageHeight) < 0.5,
               currentPreviews.map(\.windowID) == previews.map(\.windowID),
-              previews.allSatisfy({ cardsByWindowID[$0.windowID] != nil }) else {
+              previews.allSatisfy({ cardsByWindowID[$0.windowID]?.canReuseForPresentation == true }) else {
             return false
         }
 
@@ -280,6 +280,15 @@ final class PreviewPanelController {
         overflowMode: PreviewOverflowMode,
         desktopGroupingEnabled: Bool
     ) {
+        if !panel.isVisible {
+            let mouse = DockCursorTracker.shared.currentMouseLocation(preferEventTap: true)
+            initialHoverSuppressionPoint = contains(mouse) ? nil : mouse
+            cardsByWindowID.values.forEach {
+                $0.prepareForPanelPresentation(
+                    initialHoverSuppressionPoint: initialHoverSuppressionPoint
+                )
+            }
+        }
         updateCurrentPresentation(
             previews: previews,
             app: app,
@@ -1164,12 +1173,16 @@ final class PreviewPanelController {
     }
 
     private func makeCard(for preview: WindowPreview, imageHeight: CGFloat) -> PreviewCardView {
-        let cardPresentationGeneration = presentationGeneration
         let card = PreviewCardView(
             preview: preview,
             imageHeight: imageHeight,
             initialHoverSuppressionPoint: initialHoverSuppressionPoint,
             onFocus: { [weak self] preview, completion in
+                guard let self else {
+                    completion(false)
+                    return
+                }
+                let actionGeneration = self.presentationGeneration
                 WindowInventory.focusWindow(
                     windowID: preview.windowID,
                     app: preview.app
@@ -1178,12 +1191,12 @@ final class PreviewPanelController {
                         completion(false)
                         return
                     }
-                    let isStillPresented = self?.currentApp?.processIdentifier ==
+                    let isStillPresented = self.currentApp?.processIdentifier ==
                         preview.app.processIdentifier &&
-                        self?.currentPreviews.contains(where: { $0.windowID == preview.windowID }) == true &&
-                        self?.presentationGeneration == cardPresentationGeneration
+                        self.currentPreviews.contains(where: { $0.windowID == preview.windowID }) &&
+                        self.presentationGeneration == actionGeneration
                     if isStillPresented {
-                        self?.hide()
+                        self.hide()
                     }
                     completion(true)
                 }
