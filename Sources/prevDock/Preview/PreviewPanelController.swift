@@ -172,6 +172,10 @@ final class PreviewPanelController {
         cardsByWindowID[windowID]?.updateImage(image, animated: animated)
     }
 
+    func markThumbnailUnavailable(windowID: CGWindowID) {
+        cardsByWindowID[windowID]?.markThumbnailUnavailable()
+    }
+
     func reposition(near mouse: CGPoint) {
         guard panel.isVisible else { return }
         panel.setFrame(positionedFrame(width: currentSize.width, height: currentSize.height, anchoredTo: currentAnchor), display: true)

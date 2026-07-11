@@ -23,6 +23,7 @@ SPARKLE_FRAMEWORK="$SPARKLE_DIR/Sparkle.framework"
 "$ROOT_DIR/scripts/test-remote-window-cache.sh" >&2
 "$ROOT_DIR/scripts/test-window-refresh-coordinator.sh" >&2
 "$ROOT_DIR/scripts/test-window-space-membership.sh" >&2
+"$ROOT_DIR/scripts/test-window-thumbnail-capture-policy.sh" >&2
 
 ensure_sparkle() {
   if [[ -d "$SPARKLE_FRAMEWORK" ]]; then

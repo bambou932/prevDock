@@ -39,7 +39,6 @@ final class DockHoverMonitor {
     private let fastTickInterval: TimeInterval = 0.08
     private let watchdogTickInterval: TimeInterval = 1.0
     private let liveThumbnailRefreshInterval: TimeInterval = 0.45
-    private let thumbnailPresentationDeferral: TimeInterval = 0.18
     private let previewWarmupInterval: TimeInterval = 3.0
     private let previewHideGraceInterval: TimeInterval = 0.20
     private let hoverTargetCacheInterval: TimeInterval = 0.12
@@ -246,25 +245,22 @@ final class DockHoverMonitor {
         now: Date = Date()
     ) {
         lastLiveThumbnailRefresh = now
-        thumbnailRefreshGeneration &+= 1
         let generation = thumbnailRefreshGeneration
-        DispatchQueue.main.asyncAfter(deadline: .now() + thumbnailPresentationDeferral) { [weak self, weak app] in
+        WindowInventory.refreshThumbnails(
+            for: app,
+            maximumStaleCount: 2
+        ) { [weak self, weak app] windowID, result in
             guard let self,
-                  let app,
+                  app != nil,
                   self.thumbnailRefreshGeneration == generation,
                   self.lastTargetKey == expectedTargetKey,
                   self.previewController?.isVisible == true else {
                 return
             }
-            WindowInventory.refreshThumbnails(for: app, limit: 2) { [weak self, weak app] windowID, image in
-                guard let self,
-                      app != nil,
-                      self.thumbnailRefreshGeneration == generation,
-                      self.lastTargetKey == expectedTargetKey,
-                      self.previewController?.isVisible == true else {
-                    return
-                }
+            if let image = result.image {
                 self.previewController?.updateThumbnail(windowID: windowID, image: image)
+            } else {
+                self.previewController?.markThumbnailUnavailable(windowID: windowID)
             }
         }
     }
@@ -529,6 +525,7 @@ final class DockHoverMonitor {
         cancelClickValidationRefresh()
         clearCachedHoverTarget()
         hideAndResetHover()
+        WindowInventory.resetThumbnailFailuresForSpaceChange()
         wakeForMouseMoved()
     }
 
