@@ -112,7 +112,8 @@ enum DockHoverTargetResolver {
             title: displayTitle,
             url: url,
             anchor: dockItemAnchor(for: item, fallback: mouse),
-            showsInactiveLabel: showsInactiveLabel
+            showsInactiveLabel: showsInactiveLabel,
+            dockItemElement: item
         )
     }
 

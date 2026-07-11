@@ -102,6 +102,19 @@ final class DockGeometryCache {
         return containsRecentlyResolvedDockItem(point)
     }
 
+    func isInDifferentDockItem(
+        _ point: CGPoint,
+        excluding sourceAnchor: CGRect,
+        refreshIfStale: Bool = true
+    ) -> Bool {
+        if refreshIfStale {
+            self.refreshIfStale()
+        }
+        return cachedNativeLabelSuppressionRects.contains {
+            $0.contains(point) && !$0.intersects(sourceAnchor)
+        }
+    }
+
     func noteResolvedDockItem(anchor: CGRect) {
         guard let screen = ScreenGeometry.screen(containing: anchor) else { return }
         let rect = anchor

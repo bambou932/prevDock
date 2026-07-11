@@ -1,30 +1,6 @@
 import Cocoa
 import QuartzCore
 
-private struct PreviewContentStyle {
-    let cardVerticalChrome: CGFloat
-    let titleFontSize: CGFloat
-    let statusFontSize: CGFloat
-    let appIconSize: CGFloat
-}
-
-private extension PreviewContentSize {
-    var style: PreviewContentStyle {
-        switch self {
-        case .extraSmall:
-            return PreviewContentStyle(cardVerticalChrome: 24, titleFontSize: 12, statusFontSize: 10, appIconSize: 14)
-        case .small:
-            return PreviewContentStyle(cardVerticalChrome: 27, titleFontSize: 13, statusFontSize: 11, appIconSize: 16)
-        case .regular:
-            return PreviewContentStyle(cardVerticalChrome: 30, titleFontSize: 14, statusFontSize: 12, appIconSize: 18)
-        case .large:
-            return PreviewContentStyle(cardVerticalChrome: 34, titleFontSize: 16, statusFontSize: 13, appIconSize: 21)
-        case .extraLarge:
-            return PreviewContentStyle(cardVerticalChrome: 38, titleFontSize: 18, statusFontSize: 14, appIconSize: 24)
-        }
-    }
-}
-
 private extension PreviewWindowHeight {
     var scale: CGFloat {
         switch self {
@@ -44,9 +20,11 @@ private extension PreviewWindowHeight {
 
 enum PreviewMetrics {
     static let maxImageWidth: CGFloat = 520
+    static let minimumReadableImageHeight: CGFloat = 96
     static let minAspectRatio: CGFloat = 0.30
     static let maxAspectRatio: CGFloat = 3.15
     static let panelPadding: CGFloat = 6
+    static let cardContentPadding: CGFloat = 6
     static let rowSpacing: CGFloat = 0
     static let maxVisiblePreviewRows = 3
     static let emptyHorizontalPadding: CGFloat = 4
@@ -60,6 +38,13 @@ enum PreviewMetrics {
     static let desktopGroupHeaderSpacing: CGFloat = 4
     static let desktopGroupPadding: CGFloat = 5
     static let desktopGroupSpacing: CGFloat = 8
+
+    static var minimumCardWidth: CGFloat {
+        PreviewCardChromeLayout.minimumCardWidth(
+            contentStyle: contentStyle,
+            contentPadding: cardContentPadding
+        )
+    }
 
     static var desktopGroupLabelHeight: CGFloat {
         desktopGroupLabelHeight(for: PrevDockSettings.previewContentSize)
@@ -93,7 +78,7 @@ enum PreviewMetrics {
         let screenHeight = screen?.frame.height ?? 1080
         let baseHeight = clamp(screenHeight * 0.15, min: 128, max: 260)
         let scaledHeight = baseHeight * windowHeight.scale
-        return clamp(scaledHeight, min: 96, max: 338)
+        return clamp(scaledHeight, min: minimumReadableImageHeight, max: 338)
     }
 
     static func cardVerticalChrome(for contentSize: PreviewContentSize) -> CGFloat {
@@ -119,12 +104,7 @@ enum PreviewMetrics {
 
 enum PreviewLayoutViews {
     static func makePreviewRow(views: [NSView] = []) -> NSStackView {
-        let rowStack = NSStackView(views: views)
-        rowStack.orientation = .horizontal
-        rowStack.spacing = PreviewMetrics.rowSpacing
-        rowStack.alignment = .bottom
-        rowStack.distribution = .gravityAreas
-        return rowStack
+        PreviewPresentationLayout.makePreviewRow(views: views, spacing: PreviewMetrics.rowSpacing)
     }
 }
 
@@ -281,8 +261,7 @@ private final class PreviewCardHoverCoordinator {
 }
 
 final class PreviewCardView: NSView {
-    private static let contentPadding: CGFloat = 6
-    private static let labelHorizontalInset: CGFloat = 8
+    private static let contentPadding = PreviewMetrics.cardContentPadding
     private static let highlightBorderWidth: CGFloat = 2
     private static let fallbackHighlightCornerRadius: CGFloat = 10
 
@@ -312,6 +291,7 @@ final class PreviewCardView: NSView {
     private var actionFeedbackGeneration = 0
     private var isClosing = false
     private var isHovered = false
+    private var preservesPeekOnDeinit = false
     private var initialHoverGate: InitialHoverActivationGate
     private var highlightCornerRadius: CGFloat = 10
     private var highlightCornerRadiusKey: PreviewHighlightCornerRadiusKey?
@@ -352,7 +332,7 @@ final class PreviewCardView: NSView {
         peekWorkItem?.cancel()
         hoverExitWorkItem?.cancel()
         actionFeedbackWorkItem?.cancel()
-        if isInteractive {
+        if isInteractive, !preservesPeekOnDeinit {
             WindowPeekController.shared.hide(windowID: preview.windowID)
         }
     }
@@ -372,23 +352,33 @@ final class PreviewCardView: NSView {
         cardSize(thumbnailSize: thumbnailSize(for: preview, imageHeight: imageHeight), contentStyle: contentSize.style)
     }
 
-    private static func thumbnailSize(for preview: WindowPreview, imageHeight: CGFloat) -> NSSize {
+    static func layoutAspectRatio(for preview: WindowPreview) -> CGFloat {
         let boundsWidth = max(preview.bounds.width, 1)
         let boundsHeight = max(preview.bounds.height, 1)
         let imageSize = preview.image?.size ?? .zero
         let sourceWidth = boundsWidth > 1 ? boundsWidth : max(imageSize.width, 1)
         let sourceHeight = boundsHeight > 1 ? boundsHeight : max(imageSize.height, 1)
-        let aspect = min(
+        return min(
             PreviewMetrics.maxAspectRatio,
             max(PreviewMetrics.minAspectRatio, sourceWidth / sourceHeight)
         )
+    }
+
+    private static func thumbnailSize(for preview: WindowPreview, imageHeight: CGFloat) -> NSSize {
+        let aspect = layoutAspectRatio(for: preview)
         let imageWidth = min(PreviewMetrics.maxImageWidth, imageHeight * aspect)
         return NSSize(width: imageWidth, height: imageHeight)
     }
 
     private static func cardSize(thumbnailSize: NSSize, contentStyle: PreviewContentStyle) -> NSSize {
         return NSSize(
-            width: thumbnailSize.width + contentPadding * 2,
+            width: max(
+                thumbnailSize.width + contentPadding * 2,
+                PreviewCardChromeLayout.minimumCardWidth(
+                    contentStyle: contentStyle,
+                    contentPadding: contentPadding
+                )
+            ),
             height: thumbnailSize.height + contentStyle.cardVerticalChrome + contentPadding * 2
         )
     }
@@ -466,6 +456,30 @@ final class PreviewCardView: NSView {
             scheduleHoverDeactivation()
             return
         }
+    }
+
+    var isHoverActive: Bool {
+        isHovered
+    }
+
+    func preservePeekForReflow() {
+        guard isInteractive else { return }
+        preservesPeekOnDeinit = true
+        peekWorkItem?.cancel()
+        hoverExitWorkItem?.cancel()
+        PreviewCardHoverCoordinator.shared.deactivate(self)
+    }
+
+    @discardableResult
+    func restoreHoverIfNeeded(at screenPoint: CGPoint) -> Bool {
+        guard isInteractive,
+              !isClosing,
+              contains(screenPoint: screenPoint) else {
+            return false
+        }
+        activateHover()
+        updateCloseButtonHover(at: screenPoint)
+        return true
     }
 
     @objc private func closeWindow(_ sender: NSButton) {
@@ -691,13 +705,17 @@ final class PreviewCardView: NSView {
         imageView.image = preview.image
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.wantsLayer = true
+        imageView.layer?.masksToBounds = true
         updateImageBackground()
         if preview.image == nil {
             let loadingView = ThumbnailLoadingView()
+            let loadingSize = PreviewLoadingPlaceholderLayout.fittedSize(in: thumbnailSize)
             imageView.addSubview(loadingView)
             NSLayoutConstraint.activate([
                 loadingView.centerXAnchor.constraint(equalTo: imageView.centerXAnchor),
-                loadingView.centerYAnchor.constraint(equalTo: imageView.centerYAnchor)
+                loadingView.centerYAnchor.constraint(equalTo: imageView.centerYAnchor),
+                loadingView.widthAnchor.constraint(equalToConstant: loadingSize.width),
+                loadingView.heightAnchor.constraint(equalToConstant: loadingSize.height)
             ])
         }
     }
@@ -741,6 +759,17 @@ final class PreviewCardView: NSView {
         closeButton.setPointerInside(closeButton.bounds.contains(buttonPoint))
     }
 
+    private func updateCloseButtonHover(at screenPoint: CGPoint) {
+        guard let window,
+              showsCloseButton,
+              !closeButton.isHidden else {
+            return
+        }
+        let windowPoint = window.convertPoint(fromScreen: screenPoint)
+        let buttonPoint = closeButton.convert(windowPoint, from: nil)
+        closeButton.setPointerInside(closeButton.bounds.contains(buttonPoint))
+    }
+
     private func makeTitleLabel() -> NSTextField {
         let label = NSTextField(labelWithString: preview.title)
         label.font = .systemFont(ofSize: contentStyle.titleFontSize, weight: .medium)
@@ -779,21 +808,23 @@ final class PreviewCardView: NSView {
     private func installConstraints(titleLabel: NSTextField, statusLabel: NSTextField) {
         let widthConstraint = widthAnchor.constraint(equalToConstant: cardSize.width)
         self.widthConstraint = widthConstraint
-        var constraints = [
+        var constraints = PreviewCardChromeLayout.horizontalConstraints(
+            container: self,
+            imageView: imageView,
+            appIconView: appIconView,
+            titleLabel: titleLabel,
+            statusLabel: statusLabel,
+            thumbnailWidth: thumbnailSize.width,
+            contentStyle: contentStyle,
+            contentPadding: Self.contentPadding
+        ) + [
             widthConstraint,
             heightAnchor.constraint(equalToConstant: cardSize.height),
-            imageView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.contentPadding),
-            imageView.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -Self.contentPadding),
             imageView.topAnchor.constraint(equalTo: topAnchor, constant: Self.contentPadding),
             imageView.heightAnchor.constraint(equalToConstant: thumbnailSize.height),
-            appIconView.leadingAnchor.constraint(equalTo: leadingAnchor, constant: Self.contentPadding + Self.labelHorizontalInset),
             appIconView.centerYAnchor.constraint(equalTo: imageView.bottomAnchor, constant: contentStyle.cardVerticalChrome / 2),
-            appIconView.widthAnchor.constraint(equalToConstant: contentStyle.appIconSize),
             appIconView.heightAnchor.constraint(equalToConstant: contentStyle.appIconSize),
-            titleLabel.leadingAnchor.constraint(equalTo: appIconView.trailingAnchor, constant: 5),
-            titleLabel.trailingAnchor.constraint(lessThanOrEqualTo: statusLabel.leadingAnchor, constant: -8),
             titleLabel.centerYAnchor.constraint(equalTo: imageView.bottomAnchor, constant: contentStyle.cardVerticalChrome / 2),
-            statusLabel.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -(Self.contentPadding + Self.labelHorizontalInset)),
             statusLabel.centerYAnchor.constraint(equalTo: titleLabel.centerYAnchor)
         ]
         if showsCloseButton {
@@ -1264,14 +1295,16 @@ final class ThumbnailLoadingView: NSView {
         label.font = .systemFont(ofSize: 11, weight: .medium)
         label.textColor = NSColor.white.withAlphaComponent(0.62)
         label.alignment = .center
+        label.lineBreakMode = .byTruncatingTail
+        label.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         addSubview(label)
         label.translatesAutoresizingMaskIntoConstraints = false
         translatesAutoresizingMaskIntoConstraints = false
         NSLayoutConstraint.activate([
             label.centerXAnchor.constraint(equalTo: centerXAnchor),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
-            widthAnchor.constraint(equalToConstant: 140),
-            heightAnchor.constraint(equalToConstant: 28)
+            label.leadingAnchor.constraint(greaterThanOrEqualTo: leadingAnchor, constant: 3),
+            label.trailingAnchor.constraint(lessThanOrEqualTo: trailingAnchor, constant: -3)
         ])
     }
 }

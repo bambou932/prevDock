@@ -6,6 +6,10 @@ final class DockLabelPanelController {
     private var currentKey: String?
     private var currentAnchor = CGRect.zero
 
+    var isVisible: Bool {
+        panel.isVisible
+    }
+
     init() {
         panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 80, height: 30),

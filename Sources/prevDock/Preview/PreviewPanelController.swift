@@ -1,6 +1,11 @@
 import Cocoa
 import QuartzCore
 
+enum PreviewPresentationResult: Equatable {
+    case shown
+    case requiresNativeDockMenu
+}
+
 final class PreviewPanelController {
     private let panel: NSPanel
     private let contentView = NSView()
@@ -12,10 +17,14 @@ final class PreviewPanelController {
     private var currentImageHeight: CGFloat = 140
     private var currentOverflowMode = PrevDockSettings.defaultPreviewOverflowMode
     private var currentDesktopGroupingEnabled = PrevDockSettings.defaultPreviewDesktopGroupingEnabled
+    private var currentAutoLayoutPlan: PreviewLayoutPlan?
+    private var currentAutoDesktopGroups: [PreviewDesktopGroup]?
     private var currentSize = NSSize(width: 160, height: 48)
     private var currentAnchor = CGRect.zero
     private var initialHoverSuppressionPoint: CGPoint?
     private var removalAnimationGeneration = 0
+    private var layoutAnimationGeneration = 0
+    private var pendingAutoHoverTransferWindowID: CGWindowID?
     private var presentationGeneration = 0
 
     var isVisible: Bool {
@@ -78,20 +87,49 @@ final class PreviewPanelController {
         }
     }
 
-    func show(previews: [WindowPreview], app: NSRunningApplication, anchoredTo anchor: CGRect) {
+    @discardableResult
+    func show(
+        previews: [WindowPreview],
+        app: NSRunningApplication,
+        anchoredTo anchor: CGRect
+    ) -> PreviewPresentationResult {
         if !panel.isVisible || currentApp?.processIdentifier != app.processIdentifier {
             presentationGeneration &+= 1
         }
         let visiblePreviews = stabilizedPreviews(previews, app: app)
-        let imageHeight = PreviewMetrics.imageHeight(anchoredTo: anchor)
+        let preferredImageHeight = PreviewMetrics.imageHeight(anchoredTo: anchor)
         let overflowMode = PrevDockSettings.previewOverflowMode
         let desktopGroupingEnabled = PrevDockSettings.previewDesktopGroupingEnabled
+        let autoLayoutPlan: PreviewLayoutPlan?
+        let autoDesktopGroups: [PreviewDesktopGroup]?
+        let imageHeight: CGFloat
+        if overflowMode == .auto, !visiblePreviews.isEmpty {
+            switch autoLayoutDecision(
+                previews: visiblePreviews,
+                anchoredTo: anchor,
+                preferredImageHeight: preferredImageHeight,
+                desktopGroupingEnabled: desktopGroupingEnabled
+            ) {
+            case .thumbnails(let plan, let groups):
+                autoLayoutPlan = plan
+                autoDesktopGroups = groups
+                imageHeight = plan.imageHeight
+            case .nativeDockMenu:
+                return .requiresNativeDockMenu
+            }
+        } else {
+            autoLayoutPlan = nil
+            autoDesktopGroups = nil
+            imageHeight = preferredImageHeight
+        }
         if canUpdatePreviewContentInPlace(
             previews: visiblePreviews,
             app: app,
             imageHeight: imageHeight,
             overflowMode: overflowMode,
-            desktopGroupingEnabled: desktopGroupingEnabled
+            desktopGroupingEnabled: desktopGroupingEnabled,
+            autoLayoutPlan: autoLayoutPlan,
+            autoDesktopGroups: autoDesktopGroups
         ) {
             updatePreviewContentInPlace(
                 previews: visiblePreviews,
@@ -99,16 +137,21 @@ final class PreviewPanelController {
                 anchoredTo: anchor,
                 imageHeight: imageHeight,
                 overflowMode: overflowMode,
-                desktopGroupingEnabled: desktopGroupingEnabled
+                desktopGroupingEnabled: desktopGroupingEnabled,
+                autoLayoutPlan: autoLayoutPlan,
+                autoDesktopGroups: autoDesktopGroups
             )
-            return
+            return .shown
         }
 
         if shouldAnimateRemoval(
             to: visiblePreviews,
             app: app,
             overflowMode: overflowMode,
-            desktopGroupingEnabled: desktopGroupingEnabled
+            desktopGroupingEnabled: desktopGroupingEnabled,
+            imageHeight: imageHeight,
+            autoLayoutPlan: autoLayoutPlan,
+            autoDesktopGroups: autoDesktopGroups
         ) {
             let removedIDs = Set(currentPreviews.map(\.windowID)).subtracting(visiblePreviews.map(\.windowID))
             animateRemoval(
@@ -118,9 +161,11 @@ final class PreviewPanelController {
                 anchor: anchor,
                 imageHeight: imageHeight,
                 overflowMode: overflowMode,
-                desktopGroupingEnabled: desktopGroupingEnabled
+                desktopGroupingEnabled: desktopGroupingEnabled,
+                autoLayoutPlan: autoLayoutPlan,
+                autoDesktopGroups: autoDesktopGroups
             )
-            return
+            return .shown
         }
 
         render(
@@ -129,7 +174,47 @@ final class PreviewPanelController {
             anchoredTo: anchor,
             imageHeight: imageHeight,
             overflowMode: overflowMode,
-            desktopGroupingEnabled: desktopGroupingEnabled
+            desktopGroupingEnabled: desktopGroupingEnabled,
+            autoLayoutPlan: autoLayoutPlan,
+            autoDesktopGroups: autoDesktopGroups
+        )
+        return .shown
+    }
+
+    func presentationRequirement(
+        previews: [WindowPreview],
+        app: NSRunningApplication,
+        anchoredTo anchor: CGRect
+    ) -> PreviewPresentationResult {
+        let visiblePreviews = stabilizedPreviews(previews, app: app)
+        guard PrevDockSettings.previewOverflowMode == .auto, !visiblePreviews.isEmpty else {
+            return .shown
+        }
+        switch autoLayoutDecision(
+            previews: visiblePreviews,
+            anchoredTo: anchor,
+            preferredImageHeight: PreviewMetrics.imageHeight(anchoredTo: anchor),
+            desktopGroupingEnabled: PrevDockSettings.previewDesktopGroupingEnabled
+        ) {
+        case .thumbnails:
+            return .shown
+        case .nativeDockMenu:
+            return .requiresNativeDockMenu
+        }
+    }
+
+    func showReadableFallback(
+        previews: [WindowPreview],
+        app: NSRunningApplication,
+        anchoredTo anchor: CGRect
+    ) {
+        render(
+            previews: stabilizedPreviews(previews, app: app),
+            app: app,
+            anchoredTo: anchor,
+            imageHeight: PreviewMetrics.minimumReadableImageHeight,
+            overflowMode: .wrap,
+            desktopGroupingEnabled: PrevDockSettings.previewDesktopGroupingEnabled
         )
     }
 
@@ -181,21 +266,20 @@ final class PreviewPanelController {
             presentationGeneration &+= 1
         }
         invalidateRemovalAnimation()
+        invalidateLayoutAnimation()
+        cancelPendingAutoHoverTransfer()
         WindowPeekController.shared.hide()
         guard panel.isVisible else { return }
         panel.orderOut(nil)
     }
 
-    func refreshForSettingsChange() {
-        guard panel.isVisible, let currentApp else { return }
-        let imageHeight = PreviewMetrics.imageHeight(anchoredTo: currentAnchor)
-        render(
+    @discardableResult
+    func refreshForSettingsChange() -> PreviewPresentationResult? {
+        guard panel.isVisible, let currentApp else { return nil }
+        return show(
             previews: currentPreviews,
             app: currentApp,
-            anchoredTo: currentAnchor,
-            imageHeight: imageHeight,
-            overflowMode: PrevDockSettings.previewOverflowMode,
-            desktopGroupingEnabled: PrevDockSettings.previewDesktopGroupingEnabled
+            anchoredTo: currentAnchor
         )
     }
 
@@ -215,8 +299,21 @@ final class PreviewPanelController {
         anchoredTo anchor: CGRect,
         imageHeight: CGFloat,
         overflowMode: PreviewOverflowMode,
-        desktopGroupingEnabled: Bool
+        desktopGroupingEnabled: Bool,
+        autoLayoutPlan: PreviewLayoutPlan? = nil,
+        autoDesktopGroups: [PreviewDesktopGroup]? = nil,
+        preservesAutoHover: Bool = false
     ) {
+        let preservesVisibleAutoHover = rebuildsVisibleAutoPresentation(
+            app: app,
+            overflowMode: overflowMode
+        )
+        let animatesAutoFrame = preservesVisibleAutoHover && currentAutoLayoutPlan != autoLayoutPlan
+        let hoverTransferWindowID = prepareAutoHoverTransfer(
+            previews: previews,
+            enabled: preservesVisibleAutoHover || preservesAutoHover
+        )
+        invalidateLayoutAnimation()
         invalidateRemovalAnimation()
         let mouse = DockCursorTracker.shared.currentMouseLocation(preferEventTap: true)
         initialHoverSuppressionPoint = contains(mouse) ? nil : mouse
@@ -229,7 +326,9 @@ final class PreviewPanelController {
             anchor: anchor,
             imageHeight: imageHeight,
             overflowMode: overflowMode,
-            desktopGroupingEnabled: desktopGroupingEnabled
+            desktopGroupingEnabled: desktopGroupingEnabled,
+            autoLayoutPlan: autoLayoutPlan,
+            autoDesktopGroups: autoDesktopGroups
         )
         addPreviewContent(
             previews: previews,
@@ -237,7 +336,9 @@ final class PreviewPanelController {
             anchoredTo: anchor,
             imageHeight: imageHeight,
             overflowMode: overflowMode,
-            desktopGroupingEnabled: desktopGroupingEnabled
+            desktopGroupingEnabled: desktopGroupingEnabled,
+            autoLayoutPlan: autoLayoutPlan,
+            autoDesktopGroups: autoDesktopGroups
         )
         currentSize = measuredSize(
             previews: previews,
@@ -245,10 +346,111 @@ final class PreviewPanelController {
             anchoredTo: anchor,
             imageHeight: imageHeight,
             overflowMode: overflowMode,
-            desktopGroupingEnabled: desktopGroupingEnabled
+            desktopGroupingEnabled: desktopGroupingEnabled,
+            autoLayoutPlan: autoLayoutPlan
         )
-        panel.setFrame(positionedFrame(width: currentSize.width, height: currentSize.height, anchoredTo: anchor), display: true)
+        let nextFrame = positionedFrame(width: currentSize.width, height: currentSize.height, anchoredTo: anchor)
+        presentRenderedContent(frame: nextFrame, animated: animatesAutoFrame && frameNeedsUpdate(panel.frame, nextFrame)) {
+            self.finishAutoHoverTransfer(windowID: hoverTransferWindowID)
+        }
+    }
+
+    private func rebuildsVisibleAutoPresentation(
+        app: NSRunningApplication,
+        overflowMode: PreviewOverflowMode
+    ) -> Bool {
+        panel.isVisible &&
+            currentApp?.processIdentifier == app.processIdentifier &&
+            currentOverflowMode == .auto &&
+            overflowMode == .auto
+    }
+
+    private func presentRenderedContent(
+        frame: NSRect,
+        animated: Bool,
+        completion: @escaping () -> Void
+    ) {
+        contentView.layoutSubtreeIfNeeded()
+        guard animated, panel.isVisible else {
+            panel.setFrame(frame, display: true)
+            contentView.layoutSubtreeIfNeeded()
+            panel.orderFrontRegardless()
+            completion()
+            return
+        }
+
+        layoutAnimationGeneration &+= 1
+        let generation = layoutAnimationGeneration
         panel.orderFrontRegardless()
+
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.14
+            context.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
+            panel.animator().setFrame(frame, display: true)
+        } completionHandler: { [weak self] in
+            guard let self,
+                  self.layoutAnimationGeneration == generation else {
+                return
+            }
+            self.contentView.layoutSubtreeIfNeeded()
+            completion()
+        }
+    }
+
+    private func invalidateLayoutAnimation() {
+        layoutAnimationGeneration &+= 1
+    }
+
+    private func prepareAutoHoverTransfer(
+        previews: [WindowPreview],
+        enabled: Bool
+    ) -> CGWindowID? {
+        guard enabled else {
+            cancelPendingAutoHoverTransfer()
+            return nil
+        }
+
+        let nextWindowIDs = Set(previews.map(\.windowID))
+        if let pendingWindowID = pendingAutoHoverTransferWindowID,
+           !nextWindowIDs.contains(pendingWindowID) {
+            WindowPeekController.shared.hide(windowID: pendingWindowID)
+            pendingAutoHoverTransferWindowID = nil
+        }
+        let hoveredWindowID = cardsByWindowID.first { windowID, card in
+            nextWindowIDs.contains(windowID) && card.isHoverActive
+        }?.key
+        if let hoveredWindowID,
+           let pendingWindowID = pendingAutoHoverTransferWindowID,
+           pendingWindowID != hoveredWindowID {
+            WindowPeekController.shared.hide(windowID: pendingWindowID)
+        }
+        guard let windowID = hoveredWindowID ?? pendingAutoHoverTransferWindowID else { return nil }
+        cardsByWindowID[windowID]?.preservePeekForReflow()
+        pendingAutoHoverTransferWindowID = windowID
+        return windowID
+    }
+
+    private func finishAutoHoverTransfer(windowID: CGWindowID?) {
+        guard let windowID,
+              pendingAutoHoverTransferWindowID == windowID else {
+            return
+        }
+        pendingAutoHoverTransferWindowID = nil
+        if cardsByWindowID.contains(where: { $0.key != windowID && $0.value.isHoverActive }) {
+            WindowPeekController.shared.hide(windowID: windowID)
+            return
+        }
+        let mouse = DockCursorTracker.shared.currentMouseLocation(preferEventTap: true)
+        guard cardsByWindowID[windowID]?.restoreHoverIfNeeded(at: mouse) == true else {
+            WindowPeekController.shared.hide(windowID: windowID)
+            return
+        }
+    }
+
+    private func cancelPendingAutoHoverTransfer() {
+        guard let windowID = pendingAutoHoverTransferWindowID else { return }
+        pendingAutoHoverTransferWindowID = nil
+        WindowPeekController.shared.hide(windowID: windowID)
     }
 
     private func canUpdatePreviewContentInPlace(
@@ -256,12 +458,16 @@ final class PreviewPanelController {
         app: NSRunningApplication,
         imageHeight: CGFloat,
         overflowMode: PreviewOverflowMode,
-        desktopGroupingEnabled: Bool
+        desktopGroupingEnabled: Bool,
+        autoLayoutPlan: PreviewLayoutPlan?,
+        autoDesktopGroups: [PreviewDesktopGroup]?
     ) -> Bool {
         guard panel.isVisible,
               currentApp?.processIdentifier == app.processIdentifier,
               currentOverflowMode == overflowMode,
               currentDesktopGroupingEnabled == desktopGroupingEnabled,
+              currentAutoLayoutPlan == autoLayoutPlan,
+              autoDesktopGroupSnapshotsMatch(currentAutoDesktopGroups, autoDesktopGroups),
               abs(currentImageHeight - imageHeight) < 0.5,
               currentPreviews.map(\.windowID) == previews.map(\.windowID),
               previews.allSatisfy({ cardsByWindowID[$0.windowID] != nil }) else {
@@ -278,7 +484,9 @@ final class PreviewPanelController {
         anchoredTo anchor: CGRect,
         imageHeight: CGFloat,
         overflowMode: PreviewOverflowMode,
-        desktopGroupingEnabled: Bool
+        desktopGroupingEnabled: Bool,
+        autoLayoutPlan: PreviewLayoutPlan?,
+        autoDesktopGroups: [PreviewDesktopGroup]?
     ) {
         updateCurrentPresentation(
             previews: previews,
@@ -286,7 +494,9 @@ final class PreviewPanelController {
             anchor: anchor,
             imageHeight: imageHeight,
             overflowMode: overflowMode,
-            desktopGroupingEnabled: desktopGroupingEnabled
+            desktopGroupingEnabled: desktopGroupingEnabled,
+            autoLayoutPlan: autoLayoutPlan,
+            autoDesktopGroups: autoDesktopGroups
         )
         previews.forEach { cardsByWindowID[$0.windowID]?.updatePreview($0) }
         currentSize = measuredSize(
@@ -295,7 +505,8 @@ final class PreviewPanelController {
             anchoredTo: anchor,
             imageHeight: imageHeight,
             overflowMode: overflowMode,
-            desktopGroupingEnabled: desktopGroupingEnabled
+            desktopGroupingEnabled: desktopGroupingEnabled,
+            autoLayoutPlan: autoLayoutPlan
         )
         let nextFrame = positionedFrame(width: currentSize.width, height: currentSize.height, anchoredTo: anchor)
         if frameNeedsUpdate(panel.frame, nextFrame) {
@@ -323,6 +534,72 @@ final class PreviewPanelController {
         }
     }
 
+    private func autoDesktopGroupSnapshotsMatch(
+        _ current: [PreviewDesktopGroup]?,
+        _ next: [PreviewDesktopGroup]?
+    ) -> Bool {
+        switch (current, next) {
+        case (nil, nil):
+            return true
+        case let (current?, next?):
+            guard current.count == next.count else { return false }
+            return zip(current, next).allSatisfy { currentGroup, nextGroup in
+                currentGroup.key == nextGroup.key &&
+                    currentGroup.title == nextGroup.title &&
+                    currentGroup.isCurrent == nextGroup.isCurrent &&
+                    currentGroup.previews.map(\.windowID) == nextGroup.previews.map(\.windowID)
+            }
+        default:
+            return false
+        }
+    }
+
+    private func autoDesktopGroupPresentationsMatch(
+        _ current: [PreviewDesktopGroup]?,
+        _ next: [PreviewDesktopGroup]?,
+        excluding excludedWindowIDs: Set<CGWindowID>
+    ) -> Bool {
+        switch (current, next) {
+        case (nil, nil):
+            return true
+        case let (current?, next?):
+            let currentGroups = current.filter {
+                $0.previews.contains { !excludedWindowIDs.contains($0.windowID) }
+            }
+            let nextGroups = next.filter {
+                $0.previews.contains { !excludedWindowIDs.contains($0.windowID) }
+            }
+            guard currentGroups.count == nextGroups.count else { return false }
+            return zip(currentGroups, nextGroups).allSatisfy { currentGroup, nextGroup in
+                currentGroup.key == nextGroup.key &&
+                    currentGroup.title == nextGroup.title &&
+                    currentGroup.isCurrent == nextGroup.isCurrent &&
+                    currentGroup.previews
+                        .map(\.windowID)
+                        .filter { !excludedWindowIDs.contains($0) } ==
+                    nextGroup.previews
+                        .map(\.windowID)
+                        .filter { !excludedWindowIDs.contains($0) }
+            }
+        default:
+            return false
+        }
+    }
+
+    private func survivingPreviewSizesMatch(
+        _ nextPreviews: [WindowPreview],
+        imageHeight: CGFloat
+    ) -> Bool {
+        let currentByWindowID = Dictionary(uniqueKeysWithValues: currentPreviews.map { ($0.windowID, $0) })
+        return nextPreviews.allSatisfy { next in
+            guard let current = currentByWindowID[next.windowID] else { return false }
+            return sizesMatch(
+                PreviewCardView.cardSize(for: current, imageHeight: currentImageHeight),
+                PreviewCardView.cardSize(for: next, imageHeight: imageHeight)
+            )
+        }
+    }
+
     private func sizesMatch(_ lhs: NSSize, _ rhs: NSSize) -> Bool {
         abs(lhs.width - rhs.width) < 0.5 && abs(lhs.height - rhs.height) < 0.5
     }
@@ -347,7 +624,9 @@ final class PreviewPanelController {
         anchor: CGRect,
         imageHeight: CGFloat,
         overflowMode: PreviewOverflowMode,
-        desktopGroupingEnabled: Bool
+        desktopGroupingEnabled: Bool,
+        autoLayoutPlan: PreviewLayoutPlan?,
+        autoDesktopGroups: [PreviewDesktopGroup]?
     ) {
         currentPreviews = previews
         currentApp = app
@@ -355,6 +634,8 @@ final class PreviewPanelController {
         currentImageHeight = imageHeight
         currentOverflowMode = overflowMode
         currentDesktopGroupingEnabled = desktopGroupingEnabled
+        currentAutoLayoutPlan = autoLayoutPlan
+        currentAutoDesktopGroups = autoDesktopGroups
     }
 
     private func addPreviewContent(
@@ -363,10 +644,18 @@ final class PreviewPanelController {
         anchoredTo anchor: CGRect,
         imageHeight: CGFloat,
         overflowMode: PreviewOverflowMode,
-        desktopGroupingEnabled: Bool
+        desktopGroupingEnabled: Bool,
+        autoLayoutPlan: PreviewLayoutPlan?,
+        autoDesktopGroups: [PreviewDesktopGroup]?
     ) {
         if previews.isEmpty {
             stackView.addArrangedSubview(EmptyPreviewView(appName: app.localizedName ?? "Application"))
+        } else if let autoLayoutPlan {
+            addAutoPreviewContent(
+                plan: autoLayoutPlan,
+                previews: previews,
+                groups: autoDesktopGroups
+            )
         } else if let groups = desktopGroups(for: previews, enabled: desktopGroupingEnabled, anchoredTo: anchor) {
             stackView.spacing = PreviewMetrics.desktopGroupSpacing
             addGroupedPreviewContent(groups: groups, anchoredTo: anchor, imageHeight: imageHeight, overflowMode: overflowMode)
@@ -381,10 +670,89 @@ final class PreviewPanelController {
         }
     }
 
+    private func addAutoPreviewContent(
+        plan: PreviewLayoutPlan,
+        previews: [WindowPreview],
+        groups: [PreviewDesktopGroup]?
+    ) {
+        let previewsByID = Dictionary(uniqueKeysWithValues: previews.map { ($0.windowID, $0) })
+        switch plan.arrangement {
+        case .rows:
+            let snapshot = PreviewPresentationLayout.installAutoRows(
+                plan: plan,
+                availableItemIDs: Set(previewsByID.keys),
+                in: stackView
+            ) { [self] windowID in
+                guard let preview = previewsByID[windowID] else {
+                    assertionFailure("Auto preview layout referenced a missing window")
+                    return nil
+                }
+                return makeCard(for: preview, imageHeight: plan.imageHeight)
+            }
+            assert(snapshot?.itemIDs == plan.itemIDs, "Auto preview hierarchy did not match its plan")
+        case .groupRows:
+            stackView.spacing = PreviewMetrics.desktopGroupSpacing
+            guard let groups else {
+                assertionFailure("Grouped Auto plan is missing its immutable group snapshot")
+                return
+            }
+            let groupsByID = Dictionary(uniqueKeysWithValues: groups.map { (layoutGroupID(for: $0.key), $0) })
+            let snapshot = PreviewPresentationLayout.installAutoGroupRows(
+                plan: plan,
+                availableItemIDs: Set(previewsByID.keys),
+                in: stackView
+            ) { [self] row in
+                var layoutRow = PreviewDesktopGroupLayoutRow()
+                for groupPlan in row.groups {
+                    guard let group = groupsByID[groupPlan.id] else {
+                        assertionFailure("Auto preview group metadata changed during rendering")
+                        return nil
+                    }
+                    let previewRows = groupPlan.itemRows.map {
+                        resolvedPreviews(for: $0.itemIDs, in: previewsByID)
+                    }
+                    layoutRow.add(PreviewDesktopGroupLayout(
+                        title: group.title,
+                        isCurrent: group.isCurrent,
+                        rows: previewRows,
+                        rowHeight: groupPlan.itemRows.first?.size.height ?? 0,
+                        size: groupPlan.size
+                    ))
+                }
+                return makeDesktopGroupLayoutRow(layoutRow, imageHeight: plan.imageHeight)
+            }
+            assert(snapshot?.itemIDs == plan.itemIDs, "Grouped Auto hierarchy did not match its plan")
+        }
+    }
+
+    private func resolvedPreviews(
+        for windowIDs: [UInt32],
+        in previewsByID: [CGWindowID: WindowPreview]
+    ) -> [WindowPreview] {
+        windowIDs.compactMap { windowID in
+            guard let preview = previewsByID[windowID] else {
+                assertionFailure("Auto preview layout referenced a missing window")
+                return nil
+            }
+            return preview
+        }
+    }
+
     private func addPreviewRow(previews: [WindowPreview], imageHeight: CGFloat) {
-        let rowStack = makePreviewRow()
-        previews.forEach { rowStack.addArrangedSubview(makeCard(for: $0, imageHeight: imageHeight)) }
-        stackView.addArrangedSubview(rowStack)
+        let row = makePreviewRow(previews: previews, imageHeight: imageHeight)
+        let size = NSSize(
+            width: rowContentWidth(for: previews, imageHeight: imageHeight),
+            height: rowHeight(for: previews, imageHeight: imageHeight)
+        )
+        PreviewPresentationLayout.installLegacyRows(
+            mode: .scroll,
+            rowViews: [row],
+            contentSize: size,
+            viewportSize: size,
+            needsScroll: false,
+            spacing: PreviewMetrics.rowSpacing,
+            in: stackView
+        )
     }
 
     private func addWrappedPreviewRows(previews: [WindowPreview], anchoredTo anchor: CGRect, imageHeight: CGFloat) {
@@ -392,16 +760,15 @@ final class PreviewPanelController {
         let rowViews = layout.rows.map {
             makeCenteredPreviewRow(previews: $0, imageHeight: imageHeight, width: layout.contentSize.width)
         }
-        if layout.needsVerticalScroll {
-            stackView.addArrangedSubview(makeVerticalScrollView(
-                rowViews: rowViews,
-                contentSize: layout.contentSize,
-                viewportSize: layout.viewportSize,
-                spacing: PreviewMetrics.rowSpacing
-            ))
-        } else {
-            rowViews.forEach(stackView.addArrangedSubview)
-        }
+        PreviewPresentationLayout.installLegacyRows(
+            mode: .wrap,
+            rowViews: rowViews,
+            contentSize: layout.contentSize,
+            viewportSize: layout.viewportSize,
+            needsScroll: layout.needsVerticalScroll,
+            spacing: PreviewMetrics.rowSpacing,
+            in: stackView
+        )
     }
 
     private func addGroupedPreviewContent(
@@ -424,57 +791,8 @@ final class PreviewPanelController {
         let viewportWidth = min(contentWidth, maxContentWidth(anchoredTo: anchor))
         let contentHeight = groupSizes.map(\.height).max() ?? 0
         let scrollViewHeight = contentHeight + groupedScrollBarHeight(contentWidth: contentWidth, anchoredTo: anchor)
-        let scrollView = makeGroupedScrollView(
-            groups: groups,
-            groupSizes: groupSizes,
-            contentSize: NSSize(width: contentWidth, height: contentHeight),
-            viewportSize: NSSize(width: viewportWidth, height: scrollViewHeight),
-            imageHeight: imageHeight
-        )
-        stackView.addArrangedSubview(scrollView)
-    }
-
-    private func addWrappedGroups(_ groups: [PreviewDesktopGroup], anchoredTo anchor: CGRect, imageHeight: CGFloat) {
-        let wrapLayout = groupedWrapLayout(for: groups, anchoredTo: anchor, imageHeight: imageHeight)
-        let rowViews = wrapLayout.rows.map {
-            makeCenteredDesktopGroupLayoutRow($0, imageHeight: imageHeight, width: wrapLayout.contentSize.width)
-        }
-        if wrapLayout.needsVerticalScroll {
-            stackView.addArrangedSubview(makeVerticalScrollView(
-                rowViews: rowViews,
-                contentSize: wrapLayout.contentSize,
-                viewportSize: wrapLayout.viewportSize,
-                spacing: PreviewMetrics.desktopGroupSpacing
-            ))
-            return
-        }
-
-        rowViews.forEach(stackView.addArrangedSubview)
-    }
-
-    private func makeGroupedScrollView(
-        groups: [PreviewDesktopGroup],
-        groupSizes: [NSSize],
-        contentSize: NSSize,
-        viewportSize: NSSize,
-        imageHeight: CGFloat
-    ) -> NSScrollView {
-        let scrollView = NSScrollView()
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.hasHorizontalScroller = contentSize.width > viewportSize.width
-        scrollView.hasVerticalScroller = false
-        scrollView.autohidesScrollers = false
-        scrollView.scrollerStyle = .legacy
-        scrollView.scrollerKnobStyle = .light
-        scrollView.horizontalScroller?.controlSize = .small
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-
-        let documentView = NSView(frame: NSRect(origin: .zero, size: contentSize))
         let groupStack = makeHorizontalStack(views: [], spacing: PreviewMetrics.desktopGroupSpacing)
         groupStack.alignment = .top
-        groupStack.translatesAutoresizingMaskIntoConstraints = false
-        documentView.addSubview(groupStack)
         for (index, group) in groups.enumerated() {
             groupStack.addArrangedSubview(makeDesktopGroupView(
                 group: group,
@@ -483,55 +801,32 @@ final class PreviewPanelController {
                 imageHeight: imageHeight
             ))
         }
-        NSLayoutConstraint.activate([
-            groupStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
-            groupStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
-            groupStack.topAnchor.constraint(equalTo: documentView.topAnchor),
-            groupStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
-            groupStack.heightAnchor.constraint(equalToConstant: contentSize.height)
-        ])
-        scrollView.documentView = documentView
-        NSLayoutConstraint.activate([
-            scrollView.widthAnchor.constraint(equalToConstant: viewportSize.width),
-            scrollView.heightAnchor.constraint(equalToConstant: viewportSize.height)
-        ])
-        return scrollView
+        PreviewPresentationLayout.installHorizontalScrollContainer(
+            rowView: groupStack,
+            contentSize: NSSize(width: contentWidth, height: contentHeight),
+            viewportSize: NSSize(width: viewportWidth, height: scrollViewHeight),
+            showsScroller: PreviewLegacyOverflowPolicy.needsHorizontalScroll(
+                contentWidth: contentWidth,
+                availableWidth: viewportWidth
+            ),
+            in: stackView
+        )
     }
 
-    private func makeVerticalScrollView(
-        rowViews: [NSView],
-        contentSize: NSSize,
-        viewportSize: NSSize,
-        spacing: CGFloat
-    ) -> NSScrollView {
-        let scrollView = NSScrollView()
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.hasHorizontalScroller = false
-        scrollView.hasVerticalScroller = true
-        scrollView.autohidesScrollers = false
-        scrollView.scrollerStyle = .legacy
-        scrollView.scrollerKnobStyle = .light
-        scrollView.verticalScroller?.controlSize = .small
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-
-        let documentView = PreviewScrollDocumentView(frame: NSRect(origin: .zero, size: contentSize))
-        let rowsStack = makeVerticalStack(views: rowViews, spacing: spacing)
-        rowsStack.translatesAutoresizingMaskIntoConstraints = false
-        documentView.addSubview(rowsStack)
-        NSLayoutConstraint.activate([
-            rowsStack.centerXAnchor.constraint(equalTo: documentView.centerXAnchor),
-            rowsStack.topAnchor.constraint(equalTo: documentView.topAnchor),
-            rowsStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor)
-        ])
-        scrollView.documentView = documentView
-        scrollView.contentView.scroll(to: .zero)
-        scrollView.reflectScrolledClipView(scrollView.contentView)
-        NSLayoutConstraint.activate([
-            scrollView.widthAnchor.constraint(equalToConstant: viewportSize.width),
-            scrollView.heightAnchor.constraint(equalToConstant: viewportSize.height)
-        ])
-        return scrollView
+    private func addWrappedGroups(_ groups: [PreviewDesktopGroup], anchoredTo anchor: CGRect, imageHeight: CGFloat) {
+        let wrapLayout = groupedWrapLayout(for: groups, anchoredTo: anchor, imageHeight: imageHeight)
+        let rowViews = wrapLayout.rows.map {
+            makeCenteredDesktopGroupLayoutRow($0, imageHeight: imageHeight, width: wrapLayout.contentSize.width)
+        }
+        PreviewPresentationLayout.installLegacyRows(
+            mode: .wrap,
+            rowViews: rowViews,
+            contentSize: wrapLayout.contentSize,
+            viewportSize: wrapLayout.viewportSize,
+            needsScroll: wrapLayout.needsVerticalScroll,
+            spacing: PreviewMetrics.desktopGroupSpacing,
+            in: stackView
+        )
     }
 
     private func makeDesktopGroupView(
@@ -641,6 +936,10 @@ final class PreviewPanelController {
             return
         }
         let nextPreviews = currentPreviews.filter { $0.windowID != windowID }
+        if currentOverflowMode == .auto {
+            _ = show(previews: nextPreviews, app: app, anchoredTo: currentAnchor)
+            return
+        }
         animateRemoval(
             windowIDs: [windowID],
             nextPreviews: nextPreviews,
@@ -648,7 +947,9 @@ final class PreviewPanelController {
             anchor: currentAnchor,
             imageHeight: currentImageHeight,
             overflowMode: currentOverflowMode,
-            desktopGroupingEnabled: currentDesktopGroupingEnabled
+            desktopGroupingEnabled: currentDesktopGroupingEnabled,
+            autoLayoutPlan: nil,
+            autoDesktopGroups: nil
         )
     }
 
@@ -663,7 +964,10 @@ final class PreviewPanelController {
         to previews: [WindowPreview],
         app: NSRunningApplication,
         overflowMode: PreviewOverflowMode,
-        desktopGroupingEnabled: Bool
+        desktopGroupingEnabled: Bool,
+        imageHeight: CGFloat,
+        autoLayoutPlan: PreviewLayoutPlan?,
+        autoDesktopGroups: [PreviewDesktopGroup]?
     ) -> Bool {
         guard panel.isVisible,
               currentApp?.processIdentifier == app.processIdentifier,
@@ -674,7 +978,25 @@ final class PreviewPanelController {
         let currentIDs = Set(currentPreviews.map(\.windowID))
         let nextIDs = Set(previews.map(\.windowID))
         let removedIDs = currentIDs.subtracting(nextIDs)
-        return !removedIDs.isEmpty && !removedIDs.isDisjoint(with: Set(cardsByWindowID.keys))
+        guard !removedIDs.isEmpty,
+              !removedIDs.isDisjoint(with: Set(cardsByWindowID.keys)) else {
+            return false
+        }
+        if overflowMode == .auto {
+            guard let currentAutoLayoutPlan,
+                  let autoLayoutPlan,
+                  abs(currentImageHeight - imageHeight) < 0.5,
+                  currentAutoLayoutPlan.shapeSignature(excluding: removedIDs) == autoLayoutPlan.shapeSignature(),
+                  autoDesktopGroupPresentationsMatch(
+                    currentAutoDesktopGroups,
+                    autoDesktopGroups,
+                    excluding: removedIDs
+                  ),
+                  survivingPreviewSizesMatch(previews, imageHeight: imageHeight) else {
+                return false
+            }
+        }
+        return true
     }
 
     private func animateRemoval(
@@ -684,7 +1006,9 @@ final class PreviewPanelController {
         anchor: CGRect,
         imageHeight: CGFloat,
         overflowMode: PreviewOverflowMode,
-        desktopGroupingEnabled: Bool
+        desktopGroupingEnabled: Bool,
+        autoLayoutPlan: PreviewLayoutPlan?,
+        autoDesktopGroups: [PreviewDesktopGroup]?
     ) {
         removalAnimationGeneration += 1
         let generation = removalAnimationGeneration
@@ -697,7 +1021,9 @@ final class PreviewPanelController {
                 anchoredTo: anchor,
                 imageHeight: imageHeight,
                 overflowMode: overflowMode,
-                desktopGroupingEnabled: desktopGroupingEnabled
+                desktopGroupingEnabled: desktopGroupingEnabled,
+                autoLayoutPlan: autoLayoutPlan,
+                autoDesktopGroups: autoDesktopGroups
             )
             return
         }
@@ -708,7 +1034,9 @@ final class PreviewPanelController {
             anchor: anchor,
             imageHeight: imageHeight,
             overflowMode: overflowMode,
-            desktopGroupingEnabled: desktopGroupingEnabled
+            desktopGroupingEnabled: desktopGroupingEnabled,
+            autoLayoutPlan: autoLayoutPlan,
+            autoDesktopGroups: autoDesktopGroups
         )
         existingCards.forEach { $0.collapseForRemoval(duration: duration) }
         windowIDs.forEach { cardsByWindowID.removeValue(forKey: $0) }
@@ -719,7 +1047,8 @@ final class PreviewPanelController {
             anchoredTo: anchor,
             imageHeight: imageHeight,
             overflowMode: overflowMode,
-            desktopGroupingEnabled: desktopGroupingEnabled
+            desktopGroupingEnabled: desktopGroupingEnabled,
+            autoLayoutPlan: autoLayoutPlan
         )
         let nextFrame = positionedFrame(width: currentSize.width, height: currentSize.height, anchoredTo: anchor)
         NSAnimationContext.runAnimationGroup { context in
@@ -741,13 +1070,141 @@ final class PreviewPanelController {
                 anchoredTo: self.currentAnchor,
                 imageHeight: self.currentImageHeight,
                 overflowMode: self.currentOverflowMode,
-                desktopGroupingEnabled: self.currentDesktopGroupingEnabled
+                desktopGroupingEnabled: self.currentDesktopGroupingEnabled,
+                autoLayoutPlan: self.currentAutoLayoutPlan,
+                autoDesktopGroups: self.currentAutoDesktopGroups,
+                preservesAutoHover: self.currentOverflowMode == .auto
             )
         }
     }
 
     private func invalidateRemovalAnimation() {
         removalAnimationGeneration += 1
+    }
+
+    private func autoLayoutDecision(
+        previews: [WindowPreview],
+        anchoredTo anchor: CGRect,
+        preferredImageHeight: CGFloat,
+        desktopGroupingEnabled: Bool
+    ) -> AutoPreviewLayoutDecision {
+        let screen = ScreenGeometry.screen(containing: anchor) ?? NSScreen.main
+        let screenFrame = screen?.frame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let visibleFrame = screen?.visibleFrame ?? NSRect(x: 0, y: 0, width: 1440, height: 900)
+        let availablePanelSize = PreviewPanelAvailableSpace.size(
+            visibleFrame: visibleFrame,
+            screenFrame: screenFrame,
+            dockAnchor: anchor,
+            dockEdge: autoLayoutDockEdge(for: anchor, in: screenFrame)
+        )
+        let metrics = autoLayoutMetrics()
+        let groups = desktopGroups(
+            for: previews,
+            enabled: desktopGroupingEnabled,
+            anchoredTo: anchor
+        )
+        let content = autoLayoutContent(
+            previews: previews,
+            groups: groups,
+            availablePanelSize: availablePanelSize,
+            metrics: metrics
+        )
+        let decision = PreviewLayoutPlanner.plan(PreviewLayoutInput(
+            content: content,
+            preferredImageHeight: preferredImageHeight,
+            minimumImageHeight: PreviewMetrics.minimumReadableImageHeight,
+            availablePanelSize: availablePanelSize,
+            backingScale: max(1, screen?.backingScaleFactor ?? 1),
+            metrics: metrics
+        ))
+        switch decision {
+        case .thumbnails(let plan):
+            return .thumbnails(plan: plan, groups: groups)
+        case .nativeDockMenu:
+            return .nativeDockMenu
+        }
+    }
+
+    private func autoLayoutDockEdge(for anchor: CGRect, in frame: CGRect) -> PreviewPanelDockEdge {
+        switch dockEdge(for: anchor, in: frame) {
+        case .bottom:
+            return .bottom
+        case .top:
+            return .top
+        case .left:
+            return .left
+        case .right:
+            return .right
+        }
+    }
+
+    private func autoLayoutContent(
+        previews: [WindowPreview],
+        groups: [PreviewDesktopGroup]?,
+        availablePanelSize: NSSize,
+        metrics: PreviewLayoutMetrics
+    ) -> PreviewLayoutContent {
+        guard let groups else {
+            return .ungrouped(previews.map { layoutItem(for: $0) })
+        }
+
+        let maximumHeaderWidth = max(
+            0,
+            availablePanelSize.width - metrics.panelPadding * 2 - metrics.groupPadding * 2
+        )
+        return .grouped(groups.map { group in
+            PreviewLayoutGroup(
+                id: layoutGroupID(for: group.key),
+                items: group.previews.map { layoutItem(for: $0) },
+                headerSize: autoGroupHeaderSize(title: group.title, maximumWidth: maximumHeaderWidth)
+            )
+        })
+    }
+
+    private func layoutItem(for preview: WindowPreview) -> PreviewLayoutItem {
+        PreviewLayoutItem(
+            id: preview.windowID,
+            aspectRatio: PreviewCardView.layoutAspectRatio(for: preview)
+        )
+    }
+
+    private func layoutGroupID(for key: PreviewDesktopGroupKey) -> PreviewLayoutGroupID {
+        switch key {
+        case .desktop(let id):
+            return .desktop(id)
+        case .unknown:
+            return .unassigned
+        }
+    }
+
+    private func autoGroupHeaderSize(title: String, maximumWidth: CGFloat) -> NSSize {
+        let font = PreviewMetrics.desktopGroupLabelFont
+        let textWidth = ceil((title as NSString).size(withAttributes: [.font: font]).width)
+        let naturalWidth = textWidth +
+            PreviewMetrics.desktopGroupLabelHorizontalPadding +
+            PreviewMetrics.desktopGroupLabelTextSlack
+        return NSSize(
+            width: min(naturalWidth, maximumWidth),
+            height: PreviewMetrics.desktopGroupLabelHeight
+        )
+    }
+
+    private func autoLayoutMetrics() -> PreviewLayoutMetrics {
+        PreviewLayoutMetrics(
+            panelPadding: PreviewMetrics.panelPadding,
+            cardHorizontalPadding: PreviewMetrics.cardContentPadding,
+            cardVerticalPadding: PreviewMetrics.cardContentPadding,
+            cardVerticalChrome: PreviewMetrics.cardVerticalChrome,
+            itemSpacing: PreviewMetrics.rowSpacing,
+            rowSpacing: PreviewMetrics.rowSpacing,
+            groupPadding: PreviewMetrics.desktopGroupPadding,
+            groupSpacing: PreviewMetrics.desktopGroupSpacing,
+            groupHeaderSpacing: PreviewMetrics.desktopGroupHeaderSpacing,
+            minimumCardWidth: PreviewMetrics.minimumCardWidth,
+            maximumImageWidth: PreviewMetrics.maxImageWidth,
+            minimumAspectRatio: PreviewMetrics.minAspectRatio,
+            maximumAspectRatio: PreviewMetrics.maxAspectRatio
+        )
     }
 
     private func layoutRows(for previews: [WindowPreview], anchoredTo anchor: CGRect, imageHeight: CGFloat) -> [[WindowPreview]] {
@@ -758,7 +1215,10 @@ final class PreviewPanelController {
         let maxHeight = maxPreviewStackHeight(imageHeight: imageHeight)
         let rows = layoutRows(for: previews, anchoredTo: anchor, imageHeight: imageHeight)
         let contentSize = previewRowsContentSize(rows, imageHeight: imageHeight)
-        guard contentSize.height > maxHeight else {
+        guard PreviewLegacyOverflowPolicy.needsWrappedVerticalScroll(
+            rowCount: rows.count,
+            maximumVisibleRows: PreviewMetrics.maxVisiblePreviewRows
+        ) else {
             return PreviewRowsLayout(rows: rows, contentSize: contentSize)
         }
 
@@ -825,8 +1285,12 @@ final class PreviewPanelController {
         anchoredTo anchor: CGRect,
         imageHeight: CGFloat,
         overflowMode: PreviewOverflowMode,
-        desktopGroupingEnabled: Bool
+        desktopGroupingEnabled: Bool,
+        autoLayoutPlan: PreviewLayoutPlan?
     ) -> NSSize {
+        if let autoLayoutPlan {
+            return PreviewPresentationLayout.measuredPanelSize(for: autoLayoutPlan)
+        }
         let panelChrome = PreviewMetrics.panelPadding * 2
         if previews.isEmpty {
             let emptySize = EmptyPreviewView(appName: app.localizedName ?? "Application").intrinsicContentSize
@@ -1081,7 +1545,10 @@ final class PreviewPanelController {
     }
 
     private func groupedScrollBarHeight(contentWidth: CGFloat, anchoredTo anchor: CGRect) -> CGFloat {
-        contentWidth > maxContentWidth(anchoredTo: anchor) ? PreviewMetrics.scrollBarHeight : 0
+        PreviewLegacyOverflowPolicy.needsHorizontalScroll(
+            contentWidth: contentWidth,
+            availableWidth: maxContentWidth(anchoredTo: anchor)
+        ) ? PreviewMetrics.scrollBarHeight : 0
     }
 
     private func maxGroupedContentWidth(anchoredTo anchor: CGRect) -> CGFloat {
@@ -1093,48 +1560,24 @@ final class PreviewPanelController {
     }
 
     private func addScrollableRow(previews: [WindowPreview], anchoredTo anchor: CGRect, imageHeight: CGFloat) {
-        let scrollView = makeScrollableRow(previews: previews, maxWidth: maxContentWidth(anchoredTo: anchor), imageHeight: imageHeight)
-        stackView.addArrangedSubview(scrollView)
-    }
-
-    private func makeScrollableRow(previews: [WindowPreview], maxWidth: CGFloat, imageHeight: CGFloat) -> NSScrollView {
-        let viewportWidth = min(rowContentWidth(for: previews, imageHeight: imageHeight), maxWidth)
+        let contentWidth = rowContentWidth(for: previews, imageHeight: imageHeight)
         let rowHeight = rowHeight(for: previews, imageHeight: imageHeight)
-        let scrollViewHeight = rowHeight + PreviewMetrics.scrollBarHeight
-        let scrollView = NSScrollView()
-        scrollView.drawsBackground = false
-        scrollView.borderType = .noBorder
-        scrollView.hasHorizontalScroller = true
-        scrollView.hasVerticalScroller = false
-        scrollView.autohidesScrollers = false
-        scrollView.scrollerStyle = .legacy
-        scrollView.scrollerKnobStyle = .light
-        scrollView.horizontalScroller?.controlSize = .small
-        scrollView.translatesAutoresizingMaskIntoConstraints = false
-
-        let documentView = NSView(frame: NSRect(
-            x: 0,
-            y: 0,
-            width: rowContentWidth(for: previews, imageHeight: imageHeight),
-            height: rowHeight
-        ))
-        let rowStack = makePreviewRow()
-        rowStack.translatesAutoresizingMaskIntoConstraints = false
-        previews.forEach { rowStack.addArrangedSubview(makeCard(for: $0, imageHeight: imageHeight)) }
-        documentView.addSubview(rowStack)
-        NSLayoutConstraint.activate([
-            rowStack.leadingAnchor.constraint(equalTo: documentView.leadingAnchor),
-            rowStack.trailingAnchor.constraint(equalTo: documentView.trailingAnchor),
-            rowStack.topAnchor.constraint(equalTo: documentView.topAnchor),
-            rowStack.bottomAnchor.constraint(equalTo: documentView.bottomAnchor),
-            rowStack.heightAnchor.constraint(equalToConstant: rowHeight)
-        ])
-        scrollView.documentView = documentView
-        NSLayoutConstraint.activate([
-            scrollView.widthAnchor.constraint(equalToConstant: viewportWidth),
-            scrollView.heightAnchor.constraint(equalToConstant: scrollViewHeight)
-        ])
-        return scrollView
+        let contentSize = NSSize(width: contentWidth, height: rowHeight)
+        let viewportSize = NSSize(
+            width: min(contentWidth, maxContentWidth(anchoredTo: anchor)),
+            height: rowHeight + PreviewMetrics.scrollBarHeight
+        )
+        let row = makePreviewRow(previews: previews, imageHeight: imageHeight)
+        let scrollView = PreviewPresentationLayout.installLegacyRows(
+            mode: .scroll,
+            rowViews: [row],
+            contentSize: contentSize,
+            viewportSize: viewportSize,
+            needsScroll: true,
+            spacing: PreviewMetrics.rowSpacing,
+            in: stackView
+        )
+        assert(scrollView != nil, "Scrollable preview row was not installed")
     }
 
     private func makePreviewRow() -> NSStackView {
@@ -1220,11 +1663,10 @@ final class PreviewPanelController {
     }
 
     private func needsHorizontalScroll(for previews: [WindowPreview], anchoredTo anchor: CGRect, imageHeight: CGFloat) -> Bool {
-        rowContentWidth(for: previews, imageHeight: imageHeight) > maxContentWidth(anchoredTo: anchor)
-    }
-
-    private func needsHorizontalScroll(for previews: [WindowPreview], maxWidth: CGFloat, imageHeight: CGFloat) -> Bool {
-        rowContentWidth(for: previews, imageHeight: imageHeight) > maxWidth
+        PreviewLegacyOverflowPolicy.needsHorizontalScroll(
+            contentWidth: rowContentWidth(for: previews, imageHeight: imageHeight),
+            availableWidth: maxContentWidth(anchoredTo: anchor)
+        )
     }
 
     private func previewRowsContentSize(_ rows: [[WindowPreview]], imageHeight: CGFloat) -> NSSize {
@@ -1328,6 +1770,11 @@ final class PreviewPanelController {
     }
 }
 
+private enum AutoPreviewLayoutDecision {
+    case thumbnails(plan: PreviewLayoutPlan, groups: [PreviewDesktopGroup]?)
+    case nativeDockMenu
+}
+
 private struct PreviewDesktopGroup {
     let key: PreviewDesktopGroupKey
     let title: String
@@ -1360,12 +1807,6 @@ private struct PreviewRowsLayout {
         self.contentSize = contentSize
         self.viewportSize = viewportSize ?? contentSize
         self.needsVerticalScroll = needsVerticalScroll
-    }
-}
-
-private final class PreviewScrollDocumentView: NSView {
-    override var isFlipped: Bool {
-        true
     }
 }
 

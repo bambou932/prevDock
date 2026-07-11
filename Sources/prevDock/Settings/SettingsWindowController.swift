@@ -70,7 +70,7 @@ final class SettingsWindowController: NSWindowController {
 private final class SettingsContentView: NSView {
     private static let settingsGroupWidth: CGFloat = 892
     private static let settingsSliderWidth: CGFloat = 280
-    private static let optionButtonSize = NSSize(width: 424, height: 258)
+    private static let optionButtonSize = NSSize(width: 278, height: 204)
     private static let closeOptionButtonSize = NSSize(width: 424, height: 238)
     private let scrollView = NSScrollView()
     private let documentView = NSView()
@@ -284,11 +284,12 @@ private final class SettingsContentView: NSView {
     }
 
     private func makeOverflowSection() -> NSStackView {
+        let auto = makeOverflowButton(mode: .auto, title: "Auto fit")
         let scroll = makeOverflowButton(mode: .scroll, title: "1 row + scroll")
         let wrap = makeOverflowButton(mode: .wrap, title: "Wrap into rows")
         return makeVerticalStack(views: [
             makeSectionLabel(title: "Preview layout"),
-            makeHorizontalStack(views: [scroll, wrap], spacing: 12)
+            makeHorizontalStack(views: [auto, scroll, wrap], spacing: 13)
         ], spacing: 10)
     }
 
@@ -1128,15 +1129,31 @@ private enum SettingsSampleWindowTheme {
 
 private enum SettingsPreviewSamples {
     private static let windowBounds = CGRect(x: 0, y: 0, width: 1200, height: 600)
-    private static let layoutImageHeight: CGFloat = 66
+    private static let layoutImageHeight: CGFloat = 44
+    private static let autoLayoutImageHeight: CGFloat = 34
     private static let scrollVisibleCardCount: CGFloat = 2.5
     private static let closeImageHeight: CGFloat = 106
     private static let optionContentSize = PreviewContentSize.extraSmall
 
     static func layoutPreview(mode: PreviewOverflowMode) -> NSView {
-        let panel = SettingsPreviewPanelSampleView(size: NSSize(width: 408, height: 210))
-        let content = mode == .scroll ? scrollPreviewContent() : wrappedPreviewContent()
-        panel.installContent(content, insets: NSEdgeInsets(top: 6, left: 6, bottom: 6, right: 6))
+        let panel = SettingsPreviewPanelSampleView(size: NSSize(width: 262, height: 162))
+        let content: NSView
+        let verticalInset: CGFloat
+        switch mode {
+        case .auto:
+            content = autoPreviewContent()
+            verticalInset = 6
+        case .scroll:
+            content = scrollPreviewContent()
+            verticalInset = 6
+        case .wrap:
+            content = wrappedPreviewContent()
+            verticalInset = 1
+        }
+        panel.installContent(
+            content,
+            insets: NSEdgeInsets(top: verticalInset, left: 6, bottom: verticalInset, right: 6)
+        )
         return panel
     }
 
@@ -1213,11 +1230,31 @@ private enum SettingsPreviewSamples {
         return stack
     }
 
+    private static func autoPreviewContent() -> NSView {
+        let previews = autoSamplePreviews()
+        let stack = NSStackView(views: [
+            previewRow(previews: Array(previews.prefix(3)), imageHeight: autoLayoutImageHeight),
+            previewRow(previews: Array(previews.dropFirst(3)), imageHeight: autoLayoutImageHeight)
+        ])
+        stack.orientation = .vertical
+        stack.spacing = PreviewMetrics.rowSpacing
+        stack.alignment = .centerX
+        return stack
+    }
+
     private static func samplePreviews() -> [WindowPreview] {
         [
             preview(windowID: 1, title: "Work", theme: .work),
             preview(windowID: 2, title: "Files", theme: .files),
             preview(windowID: 3, title: "Pics", theme: .media)
+        ]
+    }
+
+    private static func autoSamplePreviews() -> [WindowPreview] {
+        samplePreviews() + [
+            preview(windowID: 4, title: "Notes", theme: .notes),
+            preview(windowID: 5, title: "Archive", theme: .archive),
+            preview(windowID: 6, title: "Finder", theme: .finder)
         ]
     }
 

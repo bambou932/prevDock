@@ -1,11 +1,14 @@
 import Foundation
 
 enum PreviewOverflowMode: String, CaseIterable {
+    case auto
     case wrap
     case scroll
 
     var title: String {
         switch self {
+        case .auto:
+            return "Auto"
         case .wrap:
             return "Wrap"
         case .scroll:
@@ -75,7 +78,7 @@ enum PrevDockSettings {
     static let launchAtLoginDefaultPendingKey = "launchAtLoginDefaultPending"
     static let permissionSetupShownKey = "permissionSetupShown"
     static let defaultPreviewSwitchDelay: TimeInterval = 0.3
-    static let defaultPreviewOverflowMode = PreviewOverflowMode.scroll
+    static let defaultPreviewOverflowMode = PreviewOverflowMode.auto
     static let defaultPreviewContentSize = PreviewContentSize.regular
     static let defaultPreviewWindowHeight = PreviewWindowHeight.regular
     static let defaultPreviewCloseButtonEnabled = true

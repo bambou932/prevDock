@@ -32,6 +32,8 @@ After the first approved launch, macOS should remember the exception for that in
 - Matches the Dock item to a running app by title or Dock item URL.
 - Lists the app's visible and AX-discoverable windows through Accessibility, Quartz Window Services, and a remote-token fallback inspired by AltTab.
 - Captures visible window thumbnails with the macOS SkyLight window capture path and displays a floating preview shelf.
+- Auto-fits every preview into the visible screen by reducing the shared thumbnail height and arranging additional rows without scrolling.
+- Falls back to the app's native macOS Dock menu when fitting every preview would make the thumbnails unreadably small.
 - Pins the preview shelf to the Dock item so it does not follow small mouse movements.
 - Focuses the clicked preview window with Accessibility before activating the owning app.
 - Hides previews immediately while Dock click or context-menu interactions are active.

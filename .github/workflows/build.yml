@@ -8,11 +8,26 @@ on:
 
 jobs:
   build:
-    name: build
-    runs-on: macos-latest
+    name: build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - macos-14
+          - macos-latest
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
+
+      - name: Test preview layout
+        run: ./scripts/test-preview-layout.sh
+
+      - name: Test preview presentation
+        run: ./scripts/test-preview-presentation.sh
+
+      - name: Test native Dock menu lifecycle
+        run: ./scripts/test-native-dock-menu-lifecycle.sh
 
       - name: Build
         run: ./scripts/build.sh
