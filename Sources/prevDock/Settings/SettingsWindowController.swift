@@ -82,7 +82,9 @@ private final class SettingsContentView: NSView {
     private let contentSizeValueLabel = NSTextField(labelWithString: "")
     private let windowHeightSlider = NSSlider()
     private let windowHeightValueLabel = NSTextField(labelWithString: "")
-    private let contentSizeSample = SettingsPreviewSampleView()
+    private lazy var previewSizeStage = SettingsPreviewStageView(
+        width: Self.settingsGroupWidth - 32
+    )
     private var overflowButtons = [PreviewOverflowMode: SettingsPreviewOptionButton]()
     private var closeButtons = [Bool: SettingsPreviewOptionButton]()
     private let launchAtLoginSwitch = NSSwitch()
@@ -121,6 +123,7 @@ private final class SettingsContentView: NSView {
 
     func refreshForPresentation() {
         updateControls()
+        previewSizeStage.prepareForPresentation()
         permissionSettingsView.refreshForPresentation()
     }
 
@@ -319,13 +322,13 @@ private final class SettingsContentView: NSView {
             valueLabel: windowHeightValueLabel,
             scale: makeWindowHeightScale()
         )
-        let controls = makeVerticalStack(views: [titleSizeBlock, heightBlock], spacing: 10)
-        let row = makeHorizontalStack(views: [controls, contentSizeSample], spacing: 18)
-        row.alignment = .centerY
+        let controls = makeHorizontalStack(views: [titleSizeBlock, heightBlock], spacing: 18)
+        controls.alignment = .top
         return makeVerticalStack(views: [
             makeSectionLabel(title: "Preview size"),
-            row
-        ], spacing: 8)
+            controls,
+            previewSizeStage
+        ], spacing: 10)
     }
 
     private func makeContentSizeScale() -> SettingsSliderTickLabelsContainer {
@@ -615,7 +618,7 @@ private final class SettingsContentView: NSView {
         windowHeightSlider.doubleValue = Double(heightIndex)
         windowHeightValueLabel.stringValue = height.title
         windowHeightSlider.setAccessibilityValueDescription(height.title)
-        contentSizeSample.update()
+        previewSizeStage.update()
     }
 
     private func showLaunchAtLoginError(_ error: Error) {
@@ -982,62 +985,229 @@ private final class SettingsSliderTickLabelsView: NSView {
     }
 }
 
-private final class SettingsPreviewSampleView: NSView {
+private final class SettingsPreviewStageView: NSView {
+    private struct ObserverRegistration {
+        let center: NotificationCenter
+        let token: NSObjectProtocol
+    }
+
     private static let previewBounds = CGRect(x: 0, y: 0, width: 1200, height: 600)
     private static let previewImage = SettingsPreviewSamples.windowImage(theme: .finder)
     private static let groupTitle = "Desktop 1"
+    private static let stageInset = SettingsPreviewStageLayout.stageInset
+    private static let panelPadding = PreviewMetrics.panelPadding
+    private static let dockGap = SettingsPreviewStageLayout.dockGap
+    private static let fallbackDockThickness: CGFloat = 72
+    private static let retryDelays: [TimeInterval] = [0, 0.25, 0.75]
+    private let stageWidth: CGFloat
+    private let sceneView = NSView()
+    private let dockClipView = NSView()
+    private let dockImageView = NSImageView()
+    private let placeholderLabel = NSTextField(wrappingLabelWithString: "")
     private var previewView: NSView?
-    private var previewConstraints = [NSLayoutConstraint]()
+    private var snapshot: DockSnapshot?
     private var widthConstraint: NSLayoutConstraint?
     private var heightConstraint: NSLayoutConstraint?
+    private var stageHeight: CGFloat = 1
+    private var captureGeneration = 0
+    private var retryWorkItems = [DispatchWorkItem]()
+    private var refreshWorkItem: DispatchWorkItem?
+    private var observers = [ObserverRegistration]()
+    private var availabilityDescription: String?
 
-    override init(frame frameRect: NSRect) {
-        super.init(frame: frameRect)
+    init(width: CGFloat) {
+        stageWidth = width
+        super.init(frame: .zero)
         configureLayout()
+        configureDockImageView()
+        configurePlaceholderLabel()
+        configureAccessibility()
+        update()
     }
 
     required init?(coder: NSCoder) {
         fatalError("init(coder:) has not been implemented")
     }
 
+    deinit {
+        cancelPendingWork()
+        removeObservers()
+    }
+
     override var intrinsicContentSize: NSSize {
-        let size = maximumSampleSize()
-        return NSSize(width: ceil(size.width), height: ceil(size.height))
+        NSSize(width: stageWidth, height: stageHeight)
+    }
+
+    override var acceptsFirstResponder: Bool {
+        false
+    }
+
+    override func hitTest(_ point: NSPoint) -> NSView? {
+        nil
+    }
+
+    override func layout() {
+        super.layout()
+        layoutStage()
     }
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
-        DispatchQueue.main.async { [weak self] in
-            self?.update()
-        }
+        cancelPendingWork()
+        removeObservers()
+        guard window?.isVisible == true, window?.isMiniaturized == false else { return }
+        installObservers()
+        scheduleDockRefresh()
+    }
+
+    override func viewDidChangeEffectiveAppearance() {
+        super.viewDidChangeEffectiveAppearance()
+        updateLayerColors()
+        scheduleDockRefresh()
     }
 
     func update() {
-        NSLayoutConstraint.deactivate(previewConstraints)
         previewView?.removeFromSuperview()
-
-        let stageSize = maximumSampleSize()
-        let imageHeight = currentImageHeight()
-        widthConstraint?.constant = ceil(stageSize.width)
-        heightConstraint?.constant = ceil(stageSize.height)
-        invalidateIntrinsicContentSize()
-
-        let preview = makePreviewSample(imageHeight: imageHeight)
-        addSubview(preview)
-        preview.translatesAutoresizingMaskIntoConstraints = false
-        previewConstraints = previewPlacementConstraints(for: preview)
-        NSLayoutConstraint.activate(previewConstraints)
+        let preview = makePreviewPanel()
+        preview.translatesAutoresizingMaskIntoConstraints = true
+        preview.setAccessibilityHidden(true)
+        sceneView.addSubview(preview, positioned: .above, relativeTo: dockClipView)
         previewView = preview
+        updateStageHeight()
+        updateAccessibilityValue()
+        needsLayout = true
+    }
+
+    func prepareForPresentation() {
+        installObservers()
+        guard window?.isMiniaturized != true else { return }
+        refreshDockSnapshot()
+    }
+
+    private func refreshDockSnapshot() {
+        captureGeneration &+= 1
+        let generation = captureGeneration
+        cancelRetryWorkItems()
+
+        guard PermissionManager.status.allGranted else {
+            snapshot = nil
+            dockImageView.image = nil
+            update()
+            showPlaceholder("Grant Accessibility and Screen Recording above to show the current Dock.")
+            return
+        }
+
+        if snapshot == nil {
+            showPlaceholder("Loading current Dock…")
+        }
+        captureSnapshot(generation: generation, attempt: 0)
     }
 
     private func configureLayout() {
         translatesAutoresizingMaskIntoConstraints = false
-        widthConstraint = widthAnchor.constraint(equalToConstant: 1)
-        heightConstraint = heightAnchor.constraint(equalToConstant: 1)
+        sceneView.translatesAutoresizingMaskIntoConstraints = true
+        sceneView.wantsLayer = true
+        sceneView.layer?.cornerRadius = 10
+        sceneView.layer?.masksToBounds = true
+        sceneView.layer?.borderWidth = 1
+        sceneView.setAccessibilityHidden(true)
+        addSubview(sceneView)
+        updateLayerColors()
+        updateStageHeight()
+        widthConstraint = widthAnchor.constraint(equalToConstant: stageWidth)
+        heightConstraint = heightAnchor.constraint(equalToConstant: stageHeight)
         widthConstraint?.isActive = true
         heightConstraint?.isActive = true
         setContentHuggingPriority(.required, for: .horizontal)
         setContentHuggingPriority(.required, for: .vertical)
+        setContentCompressionResistancePriority(.required, for: .horizontal)
+        setContentCompressionResistancePriority(.required, for: .vertical)
+    }
+
+    private func configureDockImageView() {
+        dockClipView.wantsLayer = true
+        dockClipView.layer?.masksToBounds = true
+        dockClipView.translatesAutoresizingMaskIntoConstraints = true
+        dockClipView.setAccessibilityHidden(true)
+        sceneView.addSubview(dockClipView)
+
+        dockImageView.imageAlignment = .alignBottomLeft
+        dockImageView.imageScaling = .scaleNone
+        dockImageView.translatesAutoresizingMaskIntoConstraints = true
+        dockImageView.setAccessibilityHidden(true)
+        dockClipView.addSubview(dockImageView)
+    }
+
+    private func configurePlaceholderLabel() {
+        placeholderLabel.alignment = .center
+        placeholderLabel.font = .systemFont(ofSize: 12)
+        placeholderLabel.textColor = .secondaryLabelColor
+        placeholderLabel.maximumNumberOfLines = 2
+        placeholderLabel.translatesAutoresizingMaskIntoConstraints = true
+        placeholderLabel.setAccessibilityHidden(true)
+        sceneView.addSubview(placeholderLabel, positioned: .above, relativeTo: dockClipView)
+    }
+
+    private func configureAccessibility() {
+        setAccessibilityElement(true)
+        setAccessibilityRole(.image)
+        setAccessibilityLabel("Preview size example")
+        setAccessibilityChildren([])
+    }
+
+    private func updateAccessibilityValue() {
+        let grouping = PrevDockSettings.previewDesktopGroupingEnabled ? "grouped" : "ungrouped"
+        let edge = snapshot?.geometry.edge.rawValue ?? "Dock unavailable"
+        let previewDescription =
+            "\(PrevDockSettings.previewContentSize.title) title, " +
+                "\(PrevDockSettings.previewWindowHeight.title) window, \(grouping), " +
+                "\(edge); shown at actual size; non-interactive"
+        guard let availabilityDescription else {
+            setAccessibilityValue(previewDescription)
+            return
+        }
+        setAccessibilityValue("\(availabilityDescription) \(previewDescription)")
+    }
+
+    private func makePreviewPanel() -> NSView {
+        let content = makePreviewContent(imageHeight: currentImageHeight())
+        let contentSize = measuredSize(of: content)
+        let panelSize = NSSize(
+            width: contentSize.width + Self.panelPadding * 2,
+            height: contentSize.height + Self.panelPadding * 2
+        )
+        let panel = SettingsPreviewPanelSampleView(size: panelSize, material: .underPageBackground)
+        let insets = NSEdgeInsets(
+            top: Self.panelPadding,
+            left: Self.panelPadding,
+            bottom: Self.panelPadding,
+            right: Self.panelPadding
+        )
+        panel.installContent(content, insets: insets)
+        return panel
+    }
+
+    private func makePreviewContent(imageHeight: CGFloat) -> NSView {
+        let card = makePreviewCard(imageHeight: imageHeight)
+        guard PrevDockSettings.previewDesktopGroupingEnabled else { return card }
+        let group = DesktopGroupView(
+            title: Self.groupTitle,
+            isCurrent: true,
+            size: groupedSampleSize(for: measuredSize(of: card)),
+            allowsInteraction: false
+        )
+        group.addContentRow(PreviewLayoutViews.makePreviewRow(views: [card]))
+        return group
+    }
+
+    private func makePreviewCard(imageHeight: CGFloat) -> PreviewCardView {
+        PreviewCardView(
+            preview: makeFinderPreview(),
+            imageHeight: imageHeight,
+            interactionMode: .sample,
+            showsCloseButtonOverride: PrevDockSettings.previewCloseButtonEnabled,
+            thumbnailCornerRadiusOverride: SettingsPreviewSamples.thumbnailCornerRadius
+        )
     }
 
     private func makeFinderPreview() -> WindowPreview {
@@ -1054,41 +1224,21 @@ private final class SettingsPreviewSampleView: NSView {
         )
     }
 
-    private func makePreviewSample(imageHeight: CGFloat) -> NSView {
-        let card = makePreviewCard(imageHeight: imageHeight)
-        guard PrevDockSettings.previewDesktopGroupingEnabled else { return card }
-        let cardSize = PreviewCardView.cardSize(for: makeFinderPreview(), imageHeight: imageHeight)
-        let group = DesktopGroupView(
-            title: Self.groupTitle,
-            isCurrent: true,
-            size: groupedSampleSize(for: cardSize)
-        )
-        group.addContentRow(PreviewLayoutViews.makePreviewRow(views: [card]))
-        return group
+    private func measuredSize(of view: NSView) -> NSSize {
+        let intrinsic = view.intrinsicContentSize
+        guard intrinsic.width > 0,
+              intrinsic.height > 0,
+              intrinsic.width != NSView.noIntrinsicMetric,
+              intrinsic.height != NSView.noIntrinsicMetric else {
+            return view.fittingSize
+        }
+        return intrinsic
     }
 
-    private func makePreviewCard(imageHeight: CGFloat) -> PreviewCardView {
-        PreviewCardView(
-            preview: makeFinderPreview(),
-            imageHeight: imageHeight,
-            interactionMode: .sample
-        )
-    }
-
-    private func maximumCardSize() -> NSSize {
-        let imageHeight = PreviewMetrics.imageHeight(anchoredTo: dockPreviewAnchor(), windowHeight: .extraLarge)
-        return PreviewCardView.cardSize(for: makeFinderPreview(), imageHeight: imageHeight, contentSize: .extraLarge)
-    }
-
-    private func maximumSampleSize() -> NSSize {
-        groupedSampleSize(for: maximumCardSize(), contentSize: .extraLarge)
-    }
-
-    private func currentImageHeight() -> CGFloat {
-        PreviewMetrics.imageHeight(anchoredTo: dockPreviewAnchor())
-    }
-
-    private func groupedSampleSize(for cardSize: NSSize, contentSize: PreviewContentSize? = nil) -> NSSize {
+    private func groupedSampleSize(
+        for cardSize: NSSize,
+        contentSize: PreviewContentSize? = nil
+    ) -> NSSize {
         DesktopGroupView.fittingSize(
             rowWidths: [cardSize.width],
             rowHeight: cardSize.height,
@@ -1098,22 +1248,357 @@ private final class SettingsPreviewSampleView: NSView {
         )
     }
 
-    private func previewPlacementConstraints(for preview: NSView) -> [NSLayoutConstraint] {
-        let topInset = PrevDockSettings.previewDesktopGroupingEnabled ? 0 : ungroupedCardTopInset()
-        return [
-            preview.centerXAnchor.constraint(equalTo: centerXAnchor),
-            preview.topAnchor.constraint(equalTo: topAnchor, constant: topInset)
-        ]
+    private func maximumPreviewPanelSize() -> NSSize {
+        let imageHeight = PreviewMetrics.imageHeight(
+            anchoredTo: dockPreviewAnchor(),
+            windowHeight: .extraLarge
+        )
+        let cardSize = PreviewCardView.cardSize(
+            for: makeFinderPreview(),
+            imageHeight: imageHeight,
+            contentSize: .extraLarge
+        )
+        let groupSize = groupedSampleSize(for: cardSize, contentSize: .extraLarge)
+        return NSSize(
+            width: groupSize.width + Self.panelPadding * 2,
+            height: groupSize.height + Self.panelPadding * 2
+        )
     }
 
-    private func ungroupedCardTopInset() -> CGFloat {
-        PreviewMetrics.desktopGroupPadding +
-            PreviewMetrics.desktopGroupLabelHeight(for: .extraLarge) +
-            PreviewMetrics.desktopGroupHeaderSpacing
+    private func currentImageHeight() -> CGFloat {
+        PreviewMetrics.imageHeight(anchoredTo: dockPreviewAnchor())
     }
 
     private func dockPreviewAnchor() -> CGRect {
-        DockScreenLocator.previewAnchor() ?? window?.screen?.frame ?? NSScreen.main?.frame ?? Self.previewBounds
+        snapshot?.screenFrame ?? window?.screen?.frame ?? DockScreenLocator.previewAnchor() ??
+            NSScreen.main?.frame ?? Self.previewBounds
+    }
+
+    private func updateStageHeight() {
+        let maximumPreviewHeight = maximumPreviewPanelSize().height
+        let nextHeight: CGFloat
+        switch snapshot?.geometry.edge {
+        case .left, .right:
+            nextHeight = Self.stageInset * 2 + maximumPreviewHeight
+        case .bottom, .top:
+            let dockHeight = snapshot?.geometry.imageSize.height ?? Self.fallbackDockThickness
+            nextHeight = Self.stageInset * 2 + maximumPreviewHeight + Self.dockGap + dockHeight
+        case nil:
+            nextHeight = Self.stageInset * 2 + maximumPreviewHeight + Self.dockGap + Self.fallbackDockThickness
+        }
+        stageHeight = ceil(nextHeight)
+        heightConstraint?.constant = stageHeight
+        invalidateIntrinsicContentSize()
+        needsLayout = true
+    }
+
+    private func layoutStage() {
+        guard let previewView else { return }
+        let previewSize = measuredSize(of: previewView)
+        guard let snapshot else {
+            layoutUnavailableStage(previewSize: previewSize)
+            return
+        }
+        let sceneSize = compactSceneSize(
+            previewSize: previewSize,
+            dockImageSize: snapshot.geometry.imageSize,
+            edge: snapshot.geometry.edge
+        )
+        sceneView.frame = centeredSceneFrame(size: sceneSize)
+        let result = SettingsPreviewStageLayout.calculate(
+            stageBounds: sceneView.bounds,
+            previewSize: previewSize,
+            dockImageSize: snapshot.geometry.imageSize,
+            geometry: snapshot.geometry
+        )
+        previewView.frame = result.previewFrame
+        dockClipView.frame = result.dockVisibleRect
+        dockImageView.frame = result.dockImageFrame.offsetBy(
+            dx: -result.dockVisibleRect.minX,
+            dy: -result.dockVisibleRect.minY
+        )
+        placeholderLabel.isHidden = true
+    }
+
+    private func layoutUnavailableStage(previewSize: NSSize) {
+        let sceneSize = compactSceneSize(
+            previewSize: previewSize,
+            dockImageSize: NSSize(width: previewSize.width, height: Self.fallbackDockThickness),
+            edge: .bottom
+        )
+        sceneView.frame = centeredSceneFrame(size: sceneSize)
+        let previewX = Self.stageInset
+        let previewY = Self.stageInset + Self.fallbackDockThickness + Self.dockGap
+        previewView?.frame = NSRect(origin: NSPoint(x: previewX, y: previewY), size: previewSize)
+        dockClipView.frame = .zero
+        dockImageView.frame = .zero
+        placeholderLabel.frame = NSRect(
+            x: Self.stageInset,
+            y: Self.stageInset,
+            width: previewSize.width,
+            height: Self.fallbackDockThickness
+        )
+    }
+
+    private func compactSceneSize(
+        previewSize: NSSize,
+        dockImageSize: NSSize,
+        edge: DockSnapshotEdge
+    ) -> NSSize {
+        let contentSize = SettingsPreviewStageLayout.sceneSize(
+            previewSize: previewSize,
+            dockImageSize: dockImageSize,
+            edge: edge
+        )
+        return NSSize(
+            width: ceil(contentSize.width + Self.stageInset * 2),
+            height: ceil(contentSize.height + Self.stageInset * 2)
+        )
+    }
+
+    private func centeredSceneFrame(size: NSSize) -> NSRect {
+        let origin = NSPoint(
+            x: floor((bounds.width - size.width) / 2),
+            y: floor((bounds.height - size.height) / 2)
+        )
+        return NSRect(origin: origin, size: size)
+    }
+
+    private func captureSnapshot(generation: Int, attempt: Int) {
+        guard Self.retryDelays.indices.contains(attempt) else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self, generation == self.captureGeneration else { return }
+            DockSnapshotProvider.capture(for: self.window?.screen) { [weak self] snapshot in
+                self?.handleCapture(snapshot, generation: generation, attempt: attempt)
+            }
+        }
+        retryWorkItems.append(work)
+        let delay = Self.retryDelays[attempt]
+        if delay == 0 {
+            DispatchQueue.main.async(execute: work)
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: work)
+        }
+    }
+
+    private func handleCapture(_ snapshot: DockSnapshot?, generation: Int, attempt: Int) {
+        guard generation == captureGeneration else { return }
+        guard let snapshot else {
+            let nextAttempt = attempt + 1
+            if Self.retryDelays.indices.contains(nextAttempt) {
+                captureSnapshot(generation: generation, attempt: nextAttempt)
+                return
+            }
+            discardSnapshotIfTargetChanged()
+            if self.snapshot == nil {
+                showPlaceholder(
+                    "Current Dock is hidden or temporarily unavailable. Show it, then reopen Settings to refresh."
+                )
+            }
+            return
+        }
+
+        self.snapshot = snapshot
+        availabilityDescription = nil
+        dockImageView.image = snapshot.image
+        dockImageView.isHidden = false
+        placeholderLabel.isHidden = true
+        cancelRetryWorkItems()
+        update()
+    }
+
+    private func showPlaceholder(_ message: String) {
+        availabilityDescription = message
+        placeholderLabel.stringValue = message
+        placeholderLabel.isHidden = false
+        dockImageView.isHidden = true
+        updateAccessibilityValue()
+        needsLayout = true
+    }
+
+    private func discardSnapshotIfTargetChanged() {
+        guard let snapshot, !snapshotMatchesCurrentTarget(snapshot) else { return }
+        self.snapshot = nil
+        dockImageView.image = nil
+        dockClipView.frame = .zero
+        availabilityDescription = nil
+        update()
+    }
+
+    private func snapshotMatchesCurrentTarget(_ snapshot: DockSnapshot) -> Bool {
+        guard let screen = window?.screen else { return false }
+        let location = DockScreenLocator.snapshotLocation(for: screen)
+        if DockSystemPreferences.isAutoHideEnabled {
+            return shouldRetainAutoHiddenSnapshot(snapshot, location: location)
+        }
+        guard let location else {
+            guard snapshotPreferencesMatch(snapshot),
+                  let snapshotScreen = connectedScreen(withDisplayID: snapshot.geometryKey.displayID) else {
+                return false
+            }
+            return snapshotScaleMatches(snapshot, scale: snapshotScreen.backingScaleFactor) &&
+                screenFramesMatch(snapshot.screenFrame, snapshotScreen.frame)
+        }
+        return snapshot.geometryKey.edge == location.edge &&
+            snapshot.geometryKey.displayID == location.displayID &&
+            snapshot.geometryKey.dockWidthInCentipoints == centipoints(location.dockRect.width) &&
+            snapshot.geometryKey.dockHeightInCentipoints == centipoints(location.dockRect.height) &&
+            snapshotScaleMatches(snapshot, scale: location.backingScaleFactor) &&
+            screenFramesMatch(snapshot.screenFrame, location.appKitScreenFrame)
+    }
+
+    private func shouldRetainAutoHiddenSnapshot(
+        _ snapshot: DockSnapshot,
+        location: DockSnapshotAXLocation?
+    ) -> Bool {
+        guard snapshotPreferencesMatch(snapshot),
+              let screen = connectedScreen(withDisplayID: snapshot.geometryKey.displayID),
+              snapshotScaleMatches(snapshot, scale: screen.backingScaleFactor),
+              screenFramesMatch(snapshot.screenFrame, screen.frame) else {
+            return false
+        }
+        guard let location else { return true }
+        return location.edge == snapshot.geometry.edge &&
+            location.displayID == snapshot.geometryKey.displayID &&
+            dockMainLength(location, edge: snapshot.geometry.edge) == snapshotDockMainLength(snapshot) &&
+            snapshotScaleMatches(snapshot, scale: location.backingScaleFactor) &&
+            screenFramesMatch(snapshot.screenFrame, location.appKitScreenFrame)
+    }
+
+    private func snapshotPreferencesMatch(_ snapshot: DockSnapshot) -> Bool {
+        guard DockSystemPreferences.orientation == snapshot.geometry.edge,
+              let capturedTileSize = snapshot.tileSizePreference,
+              let currentTileSize = DockSystemPreferences.tileSize else {
+            return false
+        }
+        return abs(capturedTileSize - currentTileSize) <= 0.5
+    }
+
+    private func dockMainLength(
+        _ location: DockSnapshotAXLocation,
+        edge: DockSnapshotEdge
+    ) -> Int {
+        switch edge {
+        case .bottom, .top:
+            return centipoints(location.dockRect.width)
+        case .left, .right:
+            return centipoints(location.dockRect.height)
+        }
+    }
+
+    private func snapshotDockMainLength(_ snapshot: DockSnapshot) -> Int {
+        switch snapshot.geometry.edge {
+        case .bottom, .top:
+            return snapshot.geometryKey.dockWidthInCentipoints
+        case .left, .right:
+            return snapshot.geometryKey.dockHeightInCentipoints
+        }
+    }
+
+    private func snapshotScaleMatches(_ snapshot: DockSnapshot, scale: CGFloat) -> Bool {
+        let imageScaleX = CGFloat(snapshot.geometryKey.imagePixelWidth) /
+            max(1, snapshot.geometry.imageSize.width)
+        let imageScaleY = CGFloat(snapshot.geometryKey.imagePixelHeight) /
+            max(1, snapshot.geometry.imageSize.height)
+        return abs(imageScaleX - scale) < 0.05 && abs(imageScaleY - scale) < 0.05
+    }
+
+    private func displayID(for screen: NSScreen) -> UInt32? {
+        let key = NSDeviceDescriptionKey("NSScreenNumber")
+        return (screen.deviceDescription[key] as? NSNumber)?.uint32Value
+    }
+
+    private func connectedScreen(withDisplayID displayID: UInt32) -> NSScreen? {
+        NSScreen.screens.first { self.displayID(for: $0) == displayID }
+    }
+
+    private func screenFramesMatch(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
+        DockSnapshotScreenFrameKey(frame: lhs) == DockSnapshotScreenFrameKey(frame: rhs)
+    }
+
+    private func centipoints(_ value: CGFloat) -> Int {
+        guard value.isFinite else { return 0 }
+        return Int((value * 100).rounded())
+    }
+
+    private func scheduleDockRefresh() {
+        guard window?.isVisible == true, window?.isMiniaturized == false else { return }
+        refreshWorkItem?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.refreshWorkItem = nil
+            self?.refreshDockSnapshot()
+        }
+        refreshWorkItem = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.08, execute: item)
+    }
+
+    private func installObservers() {
+        guard observers.isEmpty, let window else { return }
+        let center = NotificationCenter.default
+        let notifications: [(Notification.Name, Any?)] = [
+            (PermissionManager.didChangeNotification, nil),
+            (NSApplication.didChangeScreenParametersNotification, nil),
+            (NSWindow.didBecomeKeyNotification, window),
+            (NSWindow.didChangeScreenNotification, window),
+            (NSWindow.willCloseNotification, window),
+            (NSWindow.didMiniaturizeNotification, window),
+            (NSWindow.didDeminiaturizeNotification, window)
+        ]
+        notifications.forEach { name, object in
+            let token = center.addObserver(forName: name, object: object, queue: .main) { [weak self] _ in
+                self?.handleObservedNotification(name)
+            }
+            observers.append(ObserverRegistration(center: center, token: token))
+        }
+
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        [NSWorkspace.didLaunchApplicationNotification, NSWorkspace.didTerminateApplicationNotification].forEach { name in
+            let token = workspaceCenter.addObserver(forName: name, object: nil, queue: .main) { [weak self] _ in
+                self?.scheduleDockRefresh()
+            }
+            observers.append(ObserverRegistration(center: workspaceCenter, token: token))
+        }
+    }
+
+    private func handleObservedNotification(_ name: Notification.Name) {
+        if name == NSWindow.willCloseNotification {
+            cancelPendingWork()
+            removeObservers()
+            return
+        }
+        if name == NSWindow.didMiniaturizeNotification {
+            cancelPendingWork()
+            return
+        }
+        scheduleDockRefresh()
+    }
+
+    private func removeObservers() {
+        observers.forEach { $0.center.removeObserver($0.token) }
+        observers = []
+    }
+
+    private func cancelPendingWork() {
+        captureGeneration &+= 1
+        refreshWorkItem?.cancel()
+        refreshWorkItem = nil
+        cancelRetryWorkItems()
+    }
+
+    private func cancelRetryWorkItems() {
+        retryWorkItems.forEach { $0.cancel() }
+        retryWorkItems = []
+    }
+
+    private func updateLayerColors() {
+        var background = NSColor.controlBackgroundColor
+        var border = NSColor.separatorColor
+        effectiveAppearance.performAsCurrentDrawingAppearance {
+            background = NSColor.controlBackgroundColor.withAlphaComponent(0.46)
+            border = NSColor.separatorColor.withAlphaComponent(0.55)
+        }
+        sceneView.layer?.backgroundColor = background.cgColor
+        sceneView.layer?.borderColor = border.cgColor
     }
 }
 
@@ -1128,10 +1613,11 @@ private enum SettingsSampleWindowTheme {
 
 private enum SettingsPreviewSamples {
     private static let windowBounds = CGRect(x: 0, y: 0, width: 1200, height: 600)
-    private static let layoutImageHeight: CGFloat = 66
+    private static let layoutImageHeight: CGFloat = 63
     private static let scrollVisibleCardCount: CGFloat = 2.5
     private static let closeImageHeight: CGFloat = 106
     private static let optionContentSize = PreviewContentSize.extraSmall
+    static let thumbnailCornerRadius: CGFloat = 10
 
     static func layoutPreview(mode: PreviewOverflowMode) -> NSView {
         let panel = SettingsPreviewPanelSampleView(size: NSSize(width: 408, height: 210))
@@ -1153,20 +1639,17 @@ private enum SettingsPreviewSamples {
 
     static func windowImage(theme: SettingsSampleWindowTheme) -> NSImage {
         let size = NSSize(width: windowBounds.width, height: windowBounds.height)
-        let image = NSImage(size: size)
-        image.lockFocus()
-        defer { image.unlockFocus() }
+        return NSImage(size: size, flipped: false) { imageRect in
+            NSGraphicsContext.saveGraphicsState()
+            defer { NSGraphicsContext.restoreGraphicsState() }
 
-        NSColor.clear.setFill()
-        NSRect(origin: .zero, size: size).fill()
-        let windowRect = NSRect(origin: .zero, size: size).insetBy(dx: 2, dy: 2)
-        let clip = NSBezierPath(roundedRect: windowRect, xRadius: 34, yRadius: 34)
-        clip.addClip()
-        baseColor(for: theme).setFill()
-        clip.fill()
-        drawWindowChrome(in: windowRect, theme: theme)
-        drawWindowContent(in: windowRect.insetBy(dx: 34, dy: 92), theme: theme)
-        return image
+            let windowRect = imageRect
+            baseColor(for: theme).setFill()
+            windowRect.fill()
+            drawWindowChrome(in: windowRect, theme: theme)
+            drawWindowContent(in: windowRect.insetBy(dx: 34, dy: 92), theme: theme)
+            return true
+        }
     }
 
     static func finderApplication() -> NSRunningApplication {
@@ -1261,7 +1744,8 @@ private enum SettingsPreviewSamples {
             imageHeight: imageHeight,
             interactionMode: .sample,
             contentSizeOverride: optionContentSize,
-            showsCloseButtonOverride: showsCloseButton
+            showsCloseButtonOverride: showsCloseButton,
+            thumbnailCornerRadiusOverride: thumbnailCornerRadius
         )
     }
 
@@ -1378,9 +1862,11 @@ private final class SettingsPreviewScrollDocumentView: NSView {
 
 private final class SettingsPreviewPanelSampleView: NSVisualEffectView {
     private let sampleSize: NSSize
+    private let sampleMaterial: NSVisualEffectView.Material
 
-    init(size: NSSize) {
+    init(size: NSSize, material: NSVisualEffectView.Material = .hudWindow) {
         sampleSize = size
+        sampleMaterial = material
         super.init(frame: NSRect(origin: .zero, size: size))
         configure()
     }
@@ -1407,7 +1893,7 @@ private final class SettingsPreviewPanelSampleView: NSVisualEffectView {
     }
 
     private func configure() {
-        material = .hudWindow
+        material = sampleMaterial
         blendingMode = .withinWindow
         state = .active
         wantsLayer = true

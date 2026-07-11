@@ -1,52 +1,19 @@
 import Cocoa
 import QuartzCore
 
-private struct PreviewContentStyle {
-    let cardVerticalChrome: CGFloat
-    let titleFontSize: CGFloat
-    let statusFontSize: CGFloat
-    let appIconSize: CGFloat
-}
+private typealias PreviewContentStyle = PreviewSizing.ContentMetrics
 
 private extension PreviewContentSize {
     var style: PreviewContentStyle {
-        switch self {
-        case .extraSmall:
-            return PreviewContentStyle(cardVerticalChrome: 24, titleFontSize: 12, statusFontSize: 10, appIconSize: 14)
-        case .small:
-            return PreviewContentStyle(cardVerticalChrome: 27, titleFontSize: 13, statusFontSize: 11, appIconSize: 16)
-        case .regular:
-            return PreviewContentStyle(cardVerticalChrome: 30, titleFontSize: 14, statusFontSize: 12, appIconSize: 18)
-        case .large:
-            return PreviewContentStyle(cardVerticalChrome: 34, titleFontSize: 16, statusFontSize: 13, appIconSize: 21)
-        case .extraLarge:
-            return PreviewContentStyle(cardVerticalChrome: 38, titleFontSize: 18, statusFontSize: 14, appIconSize: 24)
-        }
-    }
-}
-
-private extension PreviewWindowHeight {
-    var scale: CGFloat {
-        switch self {
-        case .extraSmall:
-            return 0.80
-        case .small:
-            return 0.90
-        case .regular:
-            return 1.00
-        case .large:
-            return 1.15
-        case .extraLarge:
-            return 1.30
-        }
+        PreviewSizing.contentMetrics(for: self)
     }
 }
 
 enum PreviewMetrics {
-    static let maxImageWidth: CGFloat = 520
-    static let minAspectRatio: CGFloat = 0.30
-    static let maxAspectRatio: CGFloat = 3.15
-    static let panelPadding: CGFloat = 6
+    static let maxImageWidth = PreviewSizing.maximumImageWidth
+    static let minAspectRatio = PreviewSizing.minimumAspectRatio
+    static let maxAspectRatio = PreviewSizing.maximumAspectRatio
+    static let panelPadding = PreviewSizing.panelPadding
     static let rowSpacing: CGFloat = 0
     static let maxVisiblePreviewRows = 3
     static let emptyHorizontalPadding: CGFloat = 4
@@ -57,8 +24,8 @@ enum PreviewMetrics {
     static let scrollBarHeight: CGFloat = ceil(NSScroller.scrollerWidth(for: .small, scrollerStyle: .legacy))
     static let desktopGroupLabelHorizontalPadding: CGFloat = 14
     static let desktopGroupLabelTextSlack: CGFloat = 12
-    static let desktopGroupHeaderSpacing: CGFloat = 4
-    static let desktopGroupPadding: CGFloat = 5
+    static let desktopGroupHeaderSpacing = PreviewSizing.desktopGroupHeaderSpacing
+    static let desktopGroupPadding = PreviewSizing.desktopGroupPadding
     static let desktopGroupSpacing: CGFloat = 8
 
     static var desktopGroupLabelHeight: CGFloat {
@@ -91,9 +58,7 @@ enum PreviewMetrics {
     ) -> CGFloat {
         let screen = ScreenGeometry.screen(containing: anchor) ?? NSScreen.main
         let screenHeight = screen?.frame.height ?? 1080
-        let baseHeight = clamp(screenHeight * 0.15, min: 128, max: 260)
-        let scaledHeight = baseHeight * windowHeight.scale
-        return clamp(scaledHeight, min: 96, max: 338)
+        return PreviewSizing.imageHeight(screenHeight: screenHeight, windowHeight: windowHeight)
     }
 
     static func cardVerticalChrome(for contentSize: PreviewContentSize) -> CGFloat {
@@ -112,9 +77,6 @@ enum PreviewMetrics {
         PrevDockSettings.previewContentSize.style
     }
 
-    private static func clamp(_ value: CGFloat, min: CGFloat, max: CGFloat) -> CGFloat {
-        Swift.max(min, Swift.min(max, value))
-    }
 }
 
 enum PreviewLayoutViews {
@@ -281,7 +243,7 @@ private final class PreviewCardHoverCoordinator {
 }
 
 final class PreviewCardView: NSView {
-    private static let contentPadding: CGFloat = 6
+    private static let contentPadding = PreviewSizing.cardContentPadding
     private static let labelHorizontalInset: CGFloat = 8
     private static let highlightBorderWidth: CGFloat = 2
     private static let fallbackHighlightCornerRadius: CGFloat = 10
@@ -298,11 +260,12 @@ final class PreviewCardView: NSView {
     private let keepsSampleCloseButtonVisible: Bool
     private let contentStyle: PreviewContentStyle
     private let interactionMode: InteractionMode
+    private let thumbnailCornerRadiusOverride: CGFloat?
     private let onFocus: (WindowPreview, @escaping (Bool) -> Void) -> Void
     private let onClose: (WindowPreview, @escaping (Bool) -> Void) -> Void
     private let imageView = NSImageView()
     private let appIconView = NSImageView()
-    private let closeButton = PreviewCloseButton()
+    private let closeButton: PreviewCloseButton
     private var titleLabel: NSTextField?
     private var statusLabel: NSTextField?
     private var widthConstraint: NSLayoutConstraint?
@@ -322,6 +285,7 @@ final class PreviewCardView: NSView {
         interactionMode: InteractionMode = .live,
         contentSizeOverride: PreviewContentSize? = nil,
         showsCloseButtonOverride: Bool? = nil,
+        thumbnailCornerRadiusOverride: CGFloat? = nil,
         initialHoverSuppressionPoint: CGPoint? = nil,
         onFocus: @escaping (WindowPreview, @escaping (Bool) -> Void) -> Void = { _, completion in
             completion(false)
@@ -336,8 +300,10 @@ final class PreviewCardView: NSView {
         keepsSampleCloseButtonVisible = interactionMode == .sample && self.showsCloseButton
         self.contentStyle = contentStyle
         self.interactionMode = interactionMode
+        self.thumbnailCornerRadiusOverride = thumbnailCornerRadiusOverride
         self.onFocus = onFocus
         self.onClose = onClose
+        self.closeButton = PreviewCloseButton(allowsInteraction: interactionMode == .live)
         self.cardSize = Self.cardSize(thumbnailSize: thumbnailSize, contentStyle: contentStyle)
         self.initialHoverGate = InitialHoverActivationGate(suppressionPoint: initialHoverSuppressionPoint)
         super.init(frame: NSRect(origin: .zero, size: cardSize))
@@ -691,6 +657,10 @@ final class PreviewCardView: NSView {
         imageView.image = preview.image
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.wantsLayer = true
+        if let thumbnailCornerRadiusOverride {
+            imageView.layer?.cornerRadius = thumbnailCornerRadiusOverride
+            imageView.layer?.masksToBounds = true
+        }
         updateImageBackground()
         if preview.image == nil {
             let loadingView = ThumbnailLoadingView()
@@ -719,9 +689,11 @@ final class PreviewCardView: NSView {
     }
 
     private func configureCloseButton() {
-        closeButton.toolTip = "Close"
-        closeButton.target = self
-        closeButton.action = #selector(closeWindow(_:))
+        if isInteractive {
+            closeButton.toolTip = "Close"
+            closeButton.target = self
+            closeButton.action = #selector(closeWindow(_:))
+        }
         closeButton.isHidden = true
         closeButton.alphaValue = 0
     }
@@ -812,10 +784,18 @@ final class PreviewCardView: NSView {
 private final class PreviewCloseButton: NSButton {
     static let side: CGFloat = 30
     private static let diameter: CGFloat = 26
+    private let allowsInteraction: Bool
     private var hoverTrackingArea: NSTrackingArea?
     private var isPointerInside = false
 
+    init(allowsInteraction: Bool = true) {
+        self.allowsInteraction = allowsInteraction
+        super.init(frame: .zero)
+        configureButton()
+    }
+
     override init(frame frameRect: NSRect) {
+        allowsInteraction = true
         super.init(frame: frameRect)
         configureButton()
     }
@@ -832,17 +812,37 @@ private final class PreviewCloseButton: NSButton {
         false
     }
 
+    override var acceptsFirstResponder: Bool {
+        allowsInteraction && super.acceptsFirstResponder
+    }
+
+    override func becomeFirstResponder() -> Bool {
+        guard allowsInteraction else { return false }
+        return super.becomeFirstResponder()
+    }
+
     override var isHighlighted: Bool {
-        didSet {
+        get {
+            allowsInteraction && super.isHighlighted
+        }
+        set {
+            guard allowsInteraction else { return }
+            super.isHighlighted = newValue
             needsDisplay = true
         }
     }
 
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
+        guard allowsInteraction else {
+            trackingAreas.forEach(removeTrackingArea)
+            hoverTrackingArea = nil
+            return
+        }
         if let hoverTrackingArea {
             removeTrackingArea(hoverTrackingArea)
         }
+        hoverTrackingArea = nil
         let area = NSTrackingArea(
             rect: bounds,
             options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
@@ -853,15 +853,23 @@ private final class PreviewCloseButton: NSButton {
     }
 
     override func mouseEntered(with event: NSEvent) {
+        guard allowsInteraction else { return }
         setPointerInside(true)
     }
 
     override func mouseMoved(with event: NSEvent) {
+        guard allowsInteraction else { return }
         setPointerInside(true)
     }
 
     override func mouseExited(with event: NSEvent) {
+        guard allowsInteraction else { return }
         setPointerInside(false)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard allowsInteraction else { return }
+        super.mouseDown(with: event)
     }
 
     override func draw(_ dirtyRect: NSRect) {
@@ -875,6 +883,8 @@ private final class PreviewCloseButton: NSButton {
         isTransparent = true
         title = ""
         focusRingType = .none
+        refusesFirstResponder = !allowsInteraction
+        isEnabled = allowsInteraction
         wantsLayer = true
         layer?.backgroundColor = NSColor.clear.cgColor
         setAccessibilityLabel("Close")
@@ -913,6 +923,7 @@ private final class PreviewCloseButton: NSButton {
     }
 
     fileprivate func setPointerInside(_ inside: Bool) {
+        guard allowsInteraction else { return }
         guard isPointerInside != inside else { return }
         isPointerInside = inside
         needsDisplay = true
@@ -924,6 +935,7 @@ final class DesktopGroupView: NSView {
     private let titleBadge: DesktopGroupTitleBadgeView?
     private let fixedSize: NSSize
     private let drawsBackground: Bool
+    private let allowsInteraction: Bool
     private var isHovered = false
     private var initialHoverGate: InitialHoverActivationGate
 
@@ -932,12 +944,14 @@ final class DesktopGroupView: NSView {
         isCurrent: Bool,
         size: NSSize,
         initialHoverSuppressionPoint: CGPoint? = nil,
-        drawsBackground: Bool = true
+        drawsBackground: Bool = true,
+        allowsInteraction: Bool = true
     ) {
         let maxTitleWidth = max(0, size.width - PreviewMetrics.desktopGroupPadding * 2)
         titleBadge = title.map { DesktopGroupTitleBadgeView(title: $0, isCurrent: isCurrent, maxWidth: maxTitleWidth) }
         fixedSize = size
         self.drawsBackground = drawsBackground
+        self.allowsInteraction = allowsInteraction
         initialHoverGate = InitialHoverActivationGate(suppressionPoint: initialHoverSuppressionPoint)
         super.init(frame: NSRect(origin: .zero, size: size))
         build()
@@ -987,6 +1001,7 @@ final class DesktopGroupView: NSView {
     }
 
     func deactivateHoverIfNeeded(outside screenPoint: CGPoint) {
+        guard allowsInteraction else { return }
         guard isHovered else { return }
         guard contains(screenPoint: screenPoint) else {
             setHovered(false)
@@ -995,8 +1010,8 @@ final class DesktopGroupView: NSView {
     }
 
     override func updateTrackingAreas() {
-        guard drawsBackground else { return }
         trackingAreas.forEach(removeTrackingArea)
+        guard drawsBackground, allowsInteraction else { return }
         addTrackingArea(NSTrackingArea(
             rect: bounds,
             options: [.activeAlways, .inVisibleRect, .mouseEnteredAndExited, .mouseMoved],
@@ -1010,19 +1025,19 @@ final class DesktopGroupView: NSView {
     }
 
     override func mouseEntered(with event: NSEvent) {
-        guard drawsBackground else { return }
+        guard drawsBackground, allowsInteraction else { return }
         guard !initialHoverGate.blocksHoverActivation() else { return }
         setHovered(true)
     }
 
     override func mouseMoved(with event: NSEvent) {
-        guard drawsBackground else { return }
+        guard drawsBackground, allowsInteraction else { return }
         guard !initialHoverGate.blocksHoverActivation() else { return }
         setHovered(true)
     }
 
     override func mouseExited(with event: NSEvent) {
-        guard drawsBackground else { return }
+        guard drawsBackground, allowsInteraction else { return }
         setHovered(false)
     }
 
