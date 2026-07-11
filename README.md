@@ -31,7 +31,7 @@ After the first approved launch, macOS should remember the exception for that in
 - Reads the Dock item under the pointer with macOS Accessibility APIs.
 - Matches the Dock item to a running app by title or Dock item URL.
 - Lists the app's visible and AX-discoverable windows through Accessibility, Quartz Window Services, and a remote-token fallback inspired by AltTab.
-- Captures visible window thumbnails with SkyLight/ScreenCaptureKit-style window capture paths and displays a floating preview shelf.
+- Captures visible window thumbnails with the macOS SkyLight window capture path and displays a floating preview shelf.
 - Pins the preview shelf to the Dock item so it does not follow small mouse movements.
 - Focuses the clicked preview window with Accessibility before activating the owning app.
 - Hides previews immediately while Dock click or context-menu interactions are active.
@@ -104,4 +104,4 @@ prevDock is licensed under the GNU General Public License v3.0.
 
 ## Dock label note
 
-macOS does not provide a supported API for disabling Dock hover labels. prevDock applies a best-effort startup workaround by backing up `com.apple.dock.plist`, clearing Dock tile `file-label` values, disabling the Dock's recent-apps section, and restarting Dock only during that startup sync. While prevDock is running, it also consumes Dock-strip mouse-move events before Dock can create its native hover label; prevDock's own hover monitor then handles previews and inactive-app labels.
+macOS does not provide a supported API for disabling Dock hover labels. The optional **Hide native Dock labels** setting uses a best-effort event filter only while prevDock is running. It does not edit Dock preferences or restart the Dock, and it fails open if reliable Dock geometry is unavailable.

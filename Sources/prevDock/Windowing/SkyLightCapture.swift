@@ -26,15 +26,16 @@ enum SkyLightCapture {
     static func capture(windowID: CGWindowID) -> CGImage? {
         var id = windowID
         let options: CGSWindowCaptureOptions = [.ignoreGlobalClipShape, .bestResolution, .fullSize]
-        guard let images = CGSHWCaptureWindowList(skyLightConnection, &id, 1, options).takeRetainedValue() as? [CGImage] else {
+        guard let result = CGSHWCaptureWindowList(skyLightConnection, &id, 1, options),
+              let images = result.takeRetainedValue() as? [CGImage] else {
             return nil
         }
         return images.first
     }
 
-    static func level(windowID: CGWindowID) -> CGWindowLevel {
+    static func level(windowID: CGWindowID) -> CGWindowLevel? {
         var level = CGWindowLevel(0)
-        _ = CGSGetWindowLevel(skyLightConnection, windowID, &level)
+        guard CGSGetWindowLevel(skyLightConnection, windowID, &level) == .success else { return nil }
         return level
     }
 
@@ -58,7 +59,8 @@ enum SkyLightCapture {
     static func spaceIDs(windowID: CGWindowID) -> [UInt64] {
         let windows = [NSNumber(value: windowID)] as CFArray
         let mask: CGSSpaceMask = [.current, .others, .user]
-        let spaces = CGSCopySpacesForWindows(skyLightConnection, mask, windows).takeRetainedValue() as NSArray
+        guard let result = CGSCopySpacesForWindows(skyLightConnection, mask, windows) else { return [] }
+        let spaces = result.takeRetainedValue() as NSArray
         return spaces.compactMap { ($0 as? NSNumber)?.uint64Value }
     }
 
@@ -67,11 +69,14 @@ enum SkyLightCapture {
         var psn = ProcessSerialNumber()
         guard HIGetProcessForPID(pid, &psn) == 0 else { return false }
         let result = SLPSSetFrontProcessWithOptions(&psn, windowID, SLPSMode.userGenerated)
-        postMakeKeyWindowEvent(to: &psn, windowID: windowID)
-        return result == .success
+        guard result == .success else { return false }
+        return postMakeKeyWindowEvent(to: &psn, windowID: windowID)
     }
 
-    private static func postMakeKeyWindowEvent(to psn: inout ProcessSerialNumber, windowID: CGWindowID) {
+    private static func postMakeKeyWindowEvent(
+        to psn: inout ProcessSerialNumber,
+        windowID: CGWindowID
+    ) -> Bool {
         var bytes = [UInt8](repeating: 0, count: 0xf8)
         bytes[0x04] = 0xf8
         bytes[0x3a] = 0x10
@@ -84,13 +89,15 @@ enum SkyLightCapture {
             bytes[0x20 + offset] = 0xff
         }
         bytes[0x08] = 0x01
-        SLPSPostEventRecordTo(&psn, &bytes)
+        let keyDownResult = SLPSPostEventRecordTo(&psn, &bytes)
         bytes[0x08] = 0x02
-        SLPSPostEventRecordTo(&psn, &bytes)
+        let keyUpResult = SLPSPostEventRecordTo(&psn, &bytes)
+        return keyDownResult == .success && keyUpResult == .success
     }
 
     private static func managedDisplaySpaceDictionaries() -> [[String: Any]] {
-        let displays = CGSCopyManagedDisplaySpaces(skyLightConnection).takeRetainedValue() as NSArray
+        guard let result = CGSCopyManagedDisplaySpaces(skyLightConnection) else { return [] }
+        let displays = result.takeRetainedValue() as NSArray
         return displays.compactMap { $0 as? [String: Any] }
     }
 
@@ -173,17 +180,17 @@ private enum SLPSMode {
 func CGSMainConnectionID() -> CGSConnectionID
 
 @_silgen_name("CGSHWCaptureWindowList")
-func CGSHWCaptureWindowList(_ connection: CGSConnectionID, _ windowList: UnsafeMutablePointer<CGWindowID>, _ windowCount: UInt32, _ options: CGSWindowCaptureOptions) -> Unmanaged<CFArray>
+func CGSHWCaptureWindowList(_ connection: CGSConnectionID, _ windowList: UnsafeMutablePointer<CGWindowID>, _ windowCount: UInt32, _ options: CGSWindowCaptureOptions) -> Unmanaged<CFArray>?
 
 @_silgen_name("CGSGetWindowLevel")
 @discardableResult
 func CGSGetWindowLevel(_ connection: CGSConnectionID, _ windowID: CGWindowID, _ level: UnsafeMutablePointer<CGWindowLevel>) -> CGError
 
 @_silgen_name("CGSCopyManagedDisplaySpaces")
-func CGSCopyManagedDisplaySpaces(_ connection: CGSConnectionID) -> Unmanaged<CFArray>
+func CGSCopyManagedDisplaySpaces(_ connection: CGSConnectionID) -> Unmanaged<CFArray>?
 
 @_silgen_name("CGSCopySpacesForWindows")
-func CGSCopySpacesForWindows(_ connection: CGSConnectionID, _ mask: CGSSpaceMask, _ windows: CFArray) -> Unmanaged<CFArray>
+func CGSCopySpacesForWindows(_ connection: CGSConnectionID, _ mask: CGSSpaceMask, _ windows: CFArray) -> Unmanaged<CFArray>?
 
 @_silgen_name("GetProcessForPID")
 @discardableResult

@@ -31,7 +31,7 @@ enum DockScreenLocator {
             return nil
         }
         let rect = AccessibilityHelpers.appKitRect(fromAccessibilityPosition: position, size: size)
-        guard let screen = screen(containing: rect) else { return rect }
+        guard let screen = ScreenGeometry.screen(containing: rect) else { return rect }
         let clipped = rect.intersection(screen.frame)
         return clipped.isNull || clipped.isEmpty ? rect : clipped
     }
@@ -52,11 +52,6 @@ enum DockScreenLocator {
         }
         return NSScreen.main?.frame
     }
-
-    private static func screen(containing rect: CGRect) -> NSScreen? {
-        NSScreen.screens.first { $0.frame.intersects(rect) || $0.frame.contains(CGPoint(x: rect.midX, y: rect.midY)) }
-    }
-
     private static func largestAreaFirst(_ lhs: CGRect, _ rhs: CGRect) -> Bool {
         lhs.width * lhs.height > rhs.width * rhs.height
     }

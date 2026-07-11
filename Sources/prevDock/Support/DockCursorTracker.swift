@@ -2,9 +2,11 @@ import Cocoa
 
 final class DockCursorTracker {
     static let shared = DockCursorTracker()
+    private static let cachedLocationLifetime: TimeInterval = 0.25
 
     private let lock = NSLock()
     private var eventTapMouseLocation: CGPoint?
+    private var eventTapMouseLocationUpdatedAt: TimeInterval = 0
 
     private init() {}
 
@@ -13,6 +15,7 @@ final class DockCursorTracker {
         let point = AccessibilityHelpers.appKitPoint(fromQuartzPoint: quartzPoint)
         lock.lock()
         eventTapMouseLocation = point
+        eventTapMouseLocationUpdatedAt = ProcessInfo.processInfo.systemUptime
         lock.unlock()
         return point
     }
@@ -20,9 +23,13 @@ final class DockCursorTracker {
     func currentMouseLocation(preferEventTap: Bool = false) -> CGPoint {
         lock.lock()
         let point = eventTapMouseLocation
+        let updatedAt = eventTapMouseLocationUpdatedAt
         lock.unlock()
 
-        if preferEventTap || PrevDockSettings.nativeDockLabelSuppressionEnabled {
+        let age = ProcessInfo.processInfo.systemUptime - updatedAt
+        let hasFreshEventTapLocation = point != nil && age <= Self.cachedLocationLifetime
+        if (preferEventTap || PrevDockSettings.nativeDockLabelSuppressionEnabled),
+           hasFreshEventTapLocation {
             return point ?? NSEvent.mouseLocation
         }
 

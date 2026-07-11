@@ -8,22 +8,42 @@ final class DockGeometryCache {
     private var cachedInteractionRects = [CGRect]()
     private var cachedEdgeEntryRects = [CGRect]()
     private var cachedNativeLabelSuppressionRects = [CGRect]()
+    private var recentlyResolvedDockItemRect: CGRect?
+    private var recentlyResolvedDockItemAt = Date.distantPast
+    private var provisionalInteractionRects = [CGRect]()
+    private var provisionalInteractionExpiresAt = Date.distantPast
+    private var lastFallbackProbeAt = Date.distantPast
     private var cachedDockPID: pid_t?
     private var lastRefresh = Date.distantPast
+    private var hasReliableGeometry = false
+    private var screenObserver: NSObjectProtocol?
+    private var dockObservers = [NSObjectProtocol]()
     private let refreshInterval: TimeInterval = 10
+    private let failedRefreshInterval: TimeInterval = 1
     private let fallbackPadding: CGFloat = 24
     private let autoHideFallbackThickness: CGFloat = 32
-    private let nativeLabelOutset: CGFloat = 96
-    private let nativeLabelCrossAxisPadding: CGFloat = 36
+    private let nativeLabelPadding: CGFloat = 4
+    private let resolvedDockItemLifetime: TimeInterval = 0.75
+    private let fallbackProbeInterval: TimeInterval = 0.3
+    private let provisionalInteractionLifetime: TimeInterval = 0.8
+    private let provisionalInteractionThickness: CGFloat = 96
 
     private init() {
-        NotificationCenter.default.addObserver(
+        screenObserver = NotificationCenter.default.addObserver(
             forName: NSApplication.didChangeScreenParametersNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             self?.refreshNow()
         }
+        installDockObservers()
+    }
+
+    deinit {
+        if let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+        }
+        dockObservers.forEach(NSWorkspace.shared.notificationCenter.removeObserver)
     }
 
     func refreshNow() {
@@ -41,11 +61,13 @@ final class DockGeometryCache {
         cachedEdgeEntryRects = dockRects.compactMap(edgeEntryRect)
         cachedNativeLabelSuppressionRects = labelSuppressionSourceRects.compactMap(nativeLabelSuppressionRect)
         cachedDockPID = dock.processIdentifier
+        hasReliableGeometry = !cachedInteractionRects.isEmpty
         lastRefresh = Date()
     }
 
     func refreshIfStale() {
-        guard Date().timeIntervalSince(lastRefresh) > refreshInterval else { return }
+        let interval = hasReliableGeometry ? refreshInterval : failedRefreshInterval
+        guard Date().timeIntervalSince(lastRefresh) > interval else { return }
         refreshNow()
     }
 
@@ -54,12 +76,19 @@ final class DockGeometryCache {
             self.refreshIfStale()
         }
 
-        if !cachedInteractionRects.isEmpty || !cachedEdgeEntryRects.isEmpty {
-            return cachedInteractionRects.contains(where: { $0.contains(point) }) ||
-                cachedEdgeEntryRects.contains(where: { $0.contains(point) })
+        if cachedInteractionRects.contains(where: { $0.contains(point) }) ||
+            cachedEdgeEntryRects.contains(where: { $0.contains(point) }) ||
+            containsRecentlyResolvedDockItem(point) ||
+            containsProvisionalInteraction(point) {
+            return true
         }
-
-        return isInFallbackDockStrip(point)
+        guard isInFallbackDockStrip(point) else { return false }
+        let now = Date()
+        guard now.timeIntervalSince(lastFallbackProbeAt) >= fallbackProbeInterval else { return false }
+        lastFallbackProbeAt = now
+        provisionalInteractionRects = makeProvisionalInteractionRects(at: point)
+        provisionalInteractionExpiresAt = now.addingTimeInterval(provisionalInteractionLifetime)
+        return true
     }
 
     func isInNativeLabelSuppressionStrip(_ point: CGPoint, refreshIfStale: Bool = true) -> Bool {
@@ -67,18 +96,82 @@ final class DockGeometryCache {
             self.refreshIfStale()
         }
 
-        guard !cachedNativeLabelSuppressionRects.isEmpty else {
-            return isInFallbackDockStrip(point)
+        if cachedNativeLabelSuppressionRects.contains(where: { $0.contains(point) }) {
+            return true
         }
-        return cachedNativeLabelSuppressionRects.contains { $0.contains(point) }
+        return containsRecentlyResolvedDockItem(point)
+    }
+
+    func noteResolvedDockItem(anchor: CGRect) {
+        guard let screen = ScreenGeometry.screen(containing: anchor) else { return }
+        let rect = anchor
+            .insetBy(dx: -nativeLabelPadding, dy: -nativeLabelPadding)
+            .intersection(screen.frame)
+        guard !rect.isNull, !rect.isEmpty else { return }
+        recentlyResolvedDockItemRect = rect
+        recentlyResolvedDockItemAt = Date()
     }
 
     private func clear() {
         cachedInteractionRects = []
         cachedEdgeEntryRects = []
         cachedNativeLabelSuppressionRects = []
+        recentlyResolvedDockItemRect = nil
+        recentlyResolvedDockItemAt = .distantPast
+        provisionalInteractionRects = []
+        provisionalInteractionExpiresAt = .distantPast
+        lastFallbackProbeAt = .distantPast
         cachedDockPID = nil
+        hasReliableGeometry = false
         lastRefresh = Date()
+    }
+
+    private func containsRecentlyResolvedDockItem(_ point: CGPoint) -> Bool {
+        guard Date().timeIntervalSince(recentlyResolvedDockItemAt) <= resolvedDockItemLifetime else {
+            recentlyResolvedDockItemRect = nil
+            return false
+        }
+        return recentlyResolvedDockItemRect?.contains(point) == true
+    }
+
+    private func containsProvisionalInteraction(_ point: CGPoint) -> Bool {
+        guard Date() <= provisionalInteractionExpiresAt else {
+            provisionalInteractionRects = []
+            return false
+        }
+        return provisionalInteractionRects.contains { $0.contains(point) }
+    }
+
+    private func makeProvisionalInteractionRects(at point: CGPoint) -> [CGRect] {
+        guard let screen = ScreenGeometry.screen(containing: point) else { return [] }
+        let frame = screen.frame
+        let visibleFrame = screen.visibleFrame
+        var rects = [CGRect]()
+        if visibleFrame.minY > frame.minY + 1 || point.y - frame.minY <= autoHideFallbackThickness {
+            rects.append(CGRect(
+                x: frame.minX,
+                y: frame.minY,
+                width: frame.width,
+                height: provisionalInteractionThickness
+            ))
+        }
+        if visibleFrame.minX > frame.minX + 1 || point.x - frame.minX <= autoHideFallbackThickness {
+            rects.append(CGRect(
+                x: frame.minX,
+                y: frame.minY,
+                width: provisionalInteractionThickness,
+                height: frame.height
+            ))
+        }
+        if visibleFrame.maxX < frame.maxX - 1 || frame.maxX - point.x <= autoHideFallbackThickness {
+            rects.append(CGRect(
+                x: frame.maxX - provisionalInteractionThickness,
+                y: frame.minY,
+                width: provisionalInteractionThickness,
+                height: frame.height
+            ))
+        }
+        return rects
     }
 
     private func dockApplication() -> NSRunningApplication? {
@@ -87,8 +180,33 @@ final class DockGeometryCache {
             cachedInteractionRects = []
             cachedEdgeEntryRects = []
             cachedNativeLabelSuppressionRects = []
+            hasReliableGeometry = false
+            DockHoverTargetResolver.invalidateDockCache()
         }
         return dock
+    }
+
+    private func installDockObservers() {
+        let center = NSWorkspace.shared.notificationCenter
+        let notifications: [Notification.Name] = [
+            NSWorkspace.didLaunchApplicationNotification,
+            NSWorkspace.didTerminateApplicationNotification
+        ]
+        dockObservers = notifications.map { name in
+            center.addObserver(forName: name, object: nil, queue: .main) { [weak self] notification in
+                self?.handleDockLifecycleChange(notification)
+            }
+        }
+    }
+
+    private func handleDockLifecycleChange(_ notification: Notification) {
+        guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+              app.bundleIdentifier == "com.apple.dock" else {
+            return
+        }
+        clear()
+        lastRefresh = .distantPast
+        DockHoverTargetResolver.invalidateDockCache()
     }
 
     private func dockLists(in element: AXUIElement, depth: Int = 0) -> [AXUIElement] {
@@ -123,13 +241,15 @@ final class DockGeometryCache {
     }
 
     private func interactionRect(for dockRect: CGRect) -> CGRect? {
-        guard let screen = screen(containing: dockRect) else { return nil }
-        let rect = dockRect.intersection(screen.frame)
+        guard let screen = ScreenGeometry.screen(containing: dockRect) else { return nil }
+        let rect = dockRect
+            .insetBy(dx: -nativeLabelPadding, dy: -nativeLabelPadding)
+            .intersection(screen.frame)
         return rect.isNull || rect.isEmpty ? nil : rect
     }
 
     private func edgeEntryRect(for dockRect: CGRect) -> CGRect? {
-        guard let screen = screen(containing: dockRect) else { return nil }
+        guard let screen = ScreenGeometry.screen(containing: dockRect) else { return nil }
         let frame = screen.frame
         let pad: CGFloat = 18
         let gapPadding: CGFloat = 4
@@ -153,63 +273,10 @@ final class DockGeometryCache {
     }
 
     private func nativeLabelSuppressionRect(for dockRect: CGRect) -> CGRect? {
-        guard let screen = screen(containing: dockRect) else { return nil }
-        let frame = screen.frame
-        let rect = dockRect.intersection(frame)
+        guard let screen = ScreenGeometry.screen(containing: dockRect) else { return nil }
+        let rect = dockRect.intersection(screen.frame)
         guard !rect.isNull, !rect.isEmpty else { return nil }
-
-        if rect.width >= rect.height {
-            return horizontalNativeLabelSuppressionRect(for: rect, in: frame)
-        }
-        return verticalNativeLabelSuppressionRect(for: rect, in: frame)
-    }
-
-    private func horizontalNativeLabelSuppressionRect(for rect: CGRect, in frame: CGRect) -> CGRect? {
-        let x = rect.minX - nativeLabelCrossAxisPadding
-        let width = rect.width + nativeLabelCrossAxisPadding * 2
-
-        if rect.midY < frame.midY {
-            return nonEmptyRect(
-                x: x,
-                y: rect.minY,
-                width: width,
-                height: rect.height + nativeLabelOutset,
-                clippedTo: frame
-            )
-        }
-
-        let y = rect.minY - nativeLabelOutset
-        return nonEmptyRect(
-            x: x,
-            y: y,
-            width: width,
-            height: rect.height + nativeLabelOutset,
-            clippedTo: frame
-        )
-    }
-
-    private func verticalNativeLabelSuppressionRect(for rect: CGRect, in frame: CGRect) -> CGRect? {
-        let y = rect.minY - nativeLabelCrossAxisPadding
-        let height = rect.height + nativeLabelCrossAxisPadding * 2
-
-        if rect.midX < frame.midX {
-            return nonEmptyRect(
-                x: rect.minX,
-                y: y,
-                width: rect.width + nativeLabelOutset,
-                height: height,
-                clippedTo: frame
-            )
-        }
-
-        let x = rect.minX - nativeLabelOutset
-        return nonEmptyRect(
-            x: x,
-            y: y,
-            width: rect.width + nativeLabelOutset,
-            height: height,
-            clippedTo: frame
-        )
+        return rect
     }
 
     private func nonEmptyRect(x: CGFloat, y: CGFloat, width: CGFloat, height: CGFloat, clippedTo frame: CGRect) -> CGRect? {
@@ -252,9 +319,5 @@ final class DockGeometryCache {
         let left = CGRect(x: frame.minX, y: frame.minY, width: thickness, height: frame.height)
         let right = CGRect(x: frame.maxX - thickness, y: frame.minY, width: thickness, height: frame.height)
         return bottom.contains(point) || left.contains(point) || right.contains(point)
-    }
-
-    private func screen(containing rect: CGRect) -> NSScreen? {
-        NSScreen.screens.first { $0.frame.intersects(rect) || $0.frame.contains(CGPoint(x: rect.midX, y: rect.midY)) }
     }
 }

@@ -4,10 +4,10 @@ enum RunningAppMatcher {
     static func matchDockItem(title: String?, url: URL?) -> NSRunningApplication? {
         let apps = regularApps
 
-        if let url,
-           isApplicationURL(url),
-           let match = apps.first(where: { bundleURL($0, matches: url) }) {
-            return match
+        if let url, isApplicationURL(url) {
+            let result = matchApplication(at: url, among: apps)
+            if let app = result.app { return app }
+            if result.isAuthoritative { return nil }
         }
 
         guard let title, !title.isEmpty else { return nil }
@@ -26,18 +26,49 @@ enum RunningAppMatcher {
 
     private static func matchDockTitle(_ title: String, among apps: [NSRunningApplication]) -> NSRunningApplication? {
         let normalizedTitle = normalize(title)
+        guard !normalizedTitle.isEmpty else { return nil }
 
-        if let exact = apps.first(where: { normalize($0.localizedName ?? "") == normalizedTitle }) {
-            return exact
+        let exactMatches = apps.filter { normalize($0.localizedName ?? "") == normalizedTitle }
+        if !exactMatches.isEmpty {
+            return preferredApplication(from: exactMatches)
         }
 
-        return apps
-            .filter { app in
-                let name = normalize(app.localizedName ?? "")
-                return !name.isEmpty && (normalizedTitle.contains(name) || name.contains(normalizedTitle))
+        let fuzzyMatches = apps.filter { app in
+            let name = normalize(app.localizedName ?? "")
+            guard !name.isEmpty,
+                  normalizedTitle.contains(name) || name.contains(normalizedTitle) else {
+                return false
             }
-            .sorted { ($0.localizedName ?? "").count > ($1.localizedName ?? "").count }
-            .first
+            let similarity = Double(min(name.count, normalizedTitle.count)) /
+                Double(max(name.count, normalizedTitle.count))
+            return similarity >= 0.6
+        }
+        guard fuzzyMatches.count == 1 else { return nil }
+        return fuzzyMatches[0]
+    }
+
+    private static func matchApplication(
+        at dockURL: URL,
+        among apps: [NSRunningApplication]
+    ) -> (app: NSRunningApplication?, isAuthoritative: Bool) {
+        let pathMatches = apps.filter { bundleURL($0, matches: dockURL) }
+        if !pathMatches.isEmpty {
+            return (preferredApplication(from: pathMatches), true)
+        }
+
+        guard let bundleIdentifier = Bundle(url: dockURL)?.bundleIdentifier else {
+            return (nil, false)
+        }
+        let identifierMatches = apps.filter { $0.bundleIdentifier == bundleIdentifier }
+        return (preferredApplication(from: identifierMatches), true)
+    }
+
+    private static func preferredApplication(
+        from apps: [NSRunningApplication]
+    ) -> NSRunningApplication? {
+        apps.first(where: \.isActive) ??
+            apps.first(where: { !$0.isHidden && !$0.isTerminated }) ??
+            apps.first(where: { !$0.isTerminated })
     }
 
     private static func bundleURL(_ app: NSRunningApplication, matches dockURL: URL) -> Bool {

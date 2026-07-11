@@ -16,6 +16,7 @@ final class WindowPeekController {
     private var isLiveRefreshActive = false
     private var isLiveRefreshCaptureInFlight = false
     private var liveRefreshGeneration = 0
+    private var liveRefreshFailureCount = 0
     private var liveImageUpdateHandler: ((CGWindowID, NSImage) -> Void)?
 
     var isShowingLivePreview: Bool {
@@ -67,20 +68,26 @@ final class WindowPeekController {
         guard !preview.isMinimized,
               preview.bounds.width >= 80,
               preview.bounds.height >= 60 else {
-            hide(windowID: preview.windowID)
+            hide()
             return
         }
 
         let frame = LivePreviewCadence.appKitFrame(fromWindowBounds: preview.bounds)
-        guard frame.width >= 80, frame.height >= 60 else { return }
+        guard frame.width >= 80,
+              frame.height >= 60,
+              ScreenGeometry.screen(containing: frame) != nil else {
+            hide()
+            return
+        }
 
         let windowChanged = currentWindowID != preview.windowID
+        let geometryChanged = currentPreview?.bounds != preview.bounds
         let needsOrdering = currentWindowID != preview.windowID ||
             !panel.isVisible ||
             dimmingPanels.contains { !$0.isVisible }
-        if windowChanged {
+        if windowChanged || geometryChanged {
             stopLiveRefresh()
-            if preview.image == nil {
+            if windowChanged, preview.image == nil {
                 clearVisiblePeek()
             }
         }
@@ -97,13 +104,11 @@ final class WindowPeekController {
         if let windowID, currentWindowID != windowID {
             return
         }
-        guard currentWindowID != nil || panel.isVisible || dimmingPanels.contains(where: \.isVisible) else {
-            return
-        }
         stopLiveRefresh()
         currentWindowID = nil
         currentPreview = nil
         performWithoutAnimation {
+            imageView.clear()
             hideDimmingPanels()
             panel.orderOut(nil)
         }
@@ -118,6 +123,7 @@ final class WindowPeekController {
     private func stopLiveRefresh() {
         isLiveRefreshActive = false
         isLiveRefreshCaptureInFlight = false
+        liveRefreshFailureCount = 0
         liveRefreshGeneration += 1
         liveRefreshWorkItem?.cancel()
         liveRefreshWorkItem = nil
@@ -133,7 +139,7 @@ final class WindowPeekController {
 
         let generation = liveRefreshGeneration
         isLiveRefreshCaptureInFlight = true
-        WindowInventory.captureFreshThumbnail(for: preview) { [weak self] image in
+        WindowInventory.captureFreshThumbnail(for: preview) { [weak self] result in
             DispatchQueue.main.async {
                 guard let self else {
                     return
@@ -141,19 +147,40 @@ final class WindowPeekController {
                 self.isLiveRefreshCaptureInFlight = false
                 guard self.isLiveRefreshActive,
                       self.liveRefreshGeneration == generation,
-                      self.currentWindowID == preview.windowID else {
+                      self.currentWindowID == preview.windowID,
+                      let currentPreview = self.currentPreview else {
                     return
                 }
-                if let image {
+                guard PermissionManager.status.screenRecordingGranted else {
+                    self.liveRefreshFailureCount += 1
+                    self.clearVisiblePeek()
+                    self.scheduleNextLiveRefresh(for: currentPreview)
+                    return
+                }
+                switch result {
+                case .captured(let image):
+                    self.liveRefreshFailureCount = 0
                     self.show(
                         image: image,
-                        frame: LivePreviewCadence.appKitFrame(fromWindowBounds: preview.bounds),
-                        windowID: preview.windowID,
+                        frame: LivePreviewCadence.appKitFrame(fromWindowBounds: currentPreview.bounds),
+                        windowID: currentPreview.windowID,
                         orderFront: false
                     )
-                    self.liveImageUpdateHandler?(preview.windowID, image)
+                    self.liveImageUpdateHandler?(currentPreview.windowID, image)
+                case .cached(let image):
+                    self.liveRefreshFailureCount += 1
+                    if !self.panel.isVisible {
+                        self.show(
+                            image: image,
+                            frame: LivePreviewCadence.appKitFrame(fromWindowBounds: currentPreview.bounds),
+                            windowID: currentPreview.windowID,
+                            orderFront: true
+                        )
+                    }
+                case .unavailable:
+                    self.liveRefreshFailureCount += 1
                 }
-                self.scheduleNextLiveRefresh(for: preview)
+                self.scheduleNextLiveRefresh(for: currentPreview)
             }
         }
     }
@@ -164,8 +191,11 @@ final class WindowPeekController {
             self?.refreshCurrentPreview()
         }
         liveRefreshWorkItem = item
+        let baseInterval = LivePreviewCadence.interval(forWindowBounds: preview.bounds)
+        let backoffMultiplier = pow(2, Double(min(liveRefreshFailureCount, 5)))
+        let interval = min(1, baseInterval * backoffMultiplier)
         DispatchQueue.main.asyncAfter(
-            deadline: .now() + LivePreviewCadence.interval(forWindowBounds: preview.bounds),
+            deadline: .now() + interval,
             execute: item
         )
     }
@@ -263,26 +293,18 @@ private final class WindowPeekImageView: NSView {
     private static let outlineColor = PrevDockColors.highlight(alpha: 0.9)
 
     private var image: NSImage?
-    private var windowID: CGWindowID?
-    private var cachedOutline: CachedWindowPeekOutline?
 
     override var isFlipped: Bool {
         true
     }
 
     func update(image: NSImage, windowID: CGWindowID) {
-        if self.windowID != windowID {
-            cachedOutline = nil
-        }
-        self.windowID = windowID
         self.image = image
         needsDisplay = true
     }
 
     func clear() {
         image = nil
-        windowID = nil
-        cachedOutline = nil
         needsDisplay = true
     }
 
@@ -298,254 +320,14 @@ private final class WindowPeekImageView: NSView {
             respectFlipped: true,
             hints: [.interpolation: NSImageInterpolation.high]
         )
-        drawOutline(for: image)
+        drawOutline()
     }
 
-    private func drawOutline(for image: NSImage) {
-        guard let outline = outlineImage(for: image) else {
-            drawFallbackOutline()
-            return
-        }
-        outline.draw(
-            in: bounds,
-            from: NSRect(origin: .zero, size: outline.size),
-            operation: .sourceOver,
-            fraction: 1,
-            respectFlipped: true,
-            hints: [.interpolation: NSImageInterpolation.high]
-        )
-    }
-
-    private func outlineImage(for image: NSImage) -> NSImage? {
-        guard bounds.width > 0,
-              bounds.height > 0,
-              let cgImage = image.cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            return nil
-        }
-
-        let borderPixels = borderPixels(for: cgImage)
-        let key = WindowPeekOutlineKey(
-            windowID: windowID,
-            width: cgImage.width,
-            height: cgImage.height,
-            borderPixels: borderPixels
-        )
-        if let cachedOutline, cachedOutline.key == key {
-            return cachedOutline.image
-        }
-
-        guard let outline = WindowPeekOutlineFactory.makeOutline(
-            from: cgImage,
-            borderPixels: borderPixels,
-            color: Self.outlineColor
-        ) else {
-            return nil
-        }
-
-        let image = NSImage(cgImage: outline, size: image.size)
-        cachedOutline = CachedWindowPeekOutline(key: key, image: image)
-        return image
-    }
-
-    private func borderPixels(for image: CGImage) -> Int {
-        let scaleX = CGFloat(image.width) / max(bounds.width, 1)
-        let scaleY = CGFloat(image.height) / max(bounds.height, 1)
-        return max(1, Int((Self.outlineWidth * max(scaleX, scaleY)).rounded(.up)))
-    }
-
-    private func drawFallbackOutline() {
+    private func drawOutline() {
         let rect = bounds.insetBy(dx: Self.outlineWidth / 2, dy: Self.outlineWidth / 2)
         let path = NSBezierPath(roundedRect: rect, xRadius: 10, yRadius: 10)
         path.lineWidth = Self.outlineWidth
         Self.outlineColor.setStroke()
         path.stroke()
-    }
-}
-
-private struct CachedWindowPeekOutline {
-    let key: WindowPeekOutlineKey
-    let image: NSImage
-}
-
-private struct WindowPeekOutlineKey: Equatable {
-    let windowID: CGWindowID?
-    let width: Int
-    let height: Int
-    let borderPixels: Int
-}
-
-private enum WindowPeekOutlineFactory {
-    private static let alphaThreshold: UInt8 = 32
-
-    static func makeOutline(from image: CGImage, borderPixels: Int, color: NSColor) -> CGImage? {
-        guard image.width > 0,
-              image.height > 0,
-              let alpha = alphaBytes(from: image) else {
-            return nil
-        }
-
-        let color = RGBAColor(color)
-        let width = image.width
-        let height = image.height
-        var output = [UInt8](repeating: 0, count: width * height * 4)
-        paintOutline(alpha: alpha, output: &output, width: width, height: height, borderPixels: borderPixels, color: color)
-        return makeImage(bytes: output, width: width, height: height)
-    }
-
-    private static func alphaBytes(from image: CGImage) -> [UInt8]? {
-        let width = image.width
-        let height = image.height
-        let bytesPerRow = width * 4
-        var rgba = [UInt8](repeating: 0, count: bytesPerRow * height)
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGImageAlphaInfo.premultipliedLast.rawValue
-
-        let didDraw = rgba.withUnsafeMutableBytes { buffer -> Bool in
-            guard let baseAddress = buffer.baseAddress,
-                  let context = CGContext(
-                      data: baseAddress,
-                      width: width,
-                      height: height,
-                      bitsPerComponent: 8,
-                      bytesPerRow: bytesPerRow,
-                      space: colorSpace,
-                      bitmapInfo: bitmapInfo
-                  ) else {
-                return false
-            }
-            context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-            return true
-        }
-        guard didDraw else { return nil }
-
-        var alpha = [UInt8](repeating: 0, count: width * height)
-        for index in 0..<alpha.count {
-            alpha[index] = rgba[index * 4 + 3]
-        }
-        return alpha
-    }
-
-    private static func paintOutline(
-        alpha: [UInt8],
-        output: inout [UInt8],
-        width: Int,
-        height: Int,
-        borderPixels: Int,
-        color: RGBAColor
-    ) {
-        let radiusSquared = borderPixels * borderPixels
-        for y in 0..<height {
-            for x in 0..<width where isEdgePixel(x: x, y: y, width: width, height: height, alpha: alpha) {
-                paintEdgePixel(
-                    x: x,
-                    y: y,
-                    alpha: alpha,
-                    output: &output,
-                    width: width,
-                    height: height,
-                    borderPixels: borderPixels,
-                    radiusSquared: radiusSquared,
-                    color: color
-                )
-            }
-        }
-    }
-
-    private static func paintEdgePixel(
-        x: Int,
-        y: Int,
-        alpha: [UInt8],
-        output: inout [UInt8],
-        width: Int,
-        height: Int,
-        borderPixels: Int,
-        radiusSquared: Int,
-        color: RGBAColor
-    ) {
-        let minY = max(0, y - borderPixels)
-        let maxY = min(height - 1, y + borderPixels)
-        let minX = max(0, x - borderPixels)
-        let maxX = min(width - 1, x + borderPixels)
-
-        for targetY in minY...maxY {
-            for targetX in minX...maxX {
-                let dx = targetX - x
-                let dy = targetY - y
-                guard dx * dx + dy * dy <= radiusSquared else { continue }
-                paintIfInside(x: targetX, y: targetY, alpha: alpha, output: &output, width: width, color: color)
-            }
-        }
-    }
-
-    private static func paintIfInside(
-        x: Int,
-        y: Int,
-        alpha: [UInt8],
-        output: inout [UInt8],
-        width: Int,
-        color: RGBAColor
-    ) {
-        let pixelIndex = y * width + x
-        let sourceAlpha = alpha[pixelIndex]
-        guard sourceAlpha > alphaThreshold else { return }
-
-        let outputAlpha = UInt8((UInt16(sourceAlpha) * UInt16(color.alpha)) / 255)
-        let outputIndex = pixelIndex * 4
-        guard outputAlpha > output[outputIndex + 3] else { return }
-
-        output[outputIndex] = UInt8((UInt16(color.red) * UInt16(outputAlpha)) / 255)
-        output[outputIndex + 1] = UInt8((UInt16(color.green) * UInt16(outputAlpha)) / 255)
-        output[outputIndex + 2] = UInt8((UInt16(color.blue) * UInt16(outputAlpha)) / 255)
-        output[outputIndex + 3] = outputAlpha
-    }
-
-    private static func isEdgePixel(x: Int, y: Int, width: Int, height: Int, alpha: [UInt8]) -> Bool {
-        let index = y * width + x
-        guard alpha[index] > alphaThreshold else { return false }
-        if x == 0 || y == 0 || x == width - 1 || y == height - 1 { return true }
-        return alpha[index - 1] <= alphaThreshold ||
-            alpha[index + 1] <= alphaThreshold ||
-            alpha[index - width] <= alphaThreshold ||
-            alpha[index + width] <= alphaThreshold
-    }
-
-    private static func makeImage(bytes: [UInt8], width: Int, height: Int) -> CGImage? {
-        let bytesPerRow = width * 4
-        let colorSpace = CGColorSpaceCreateDeviceRGB()
-        let bitmapInfo = CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue)
-        let data = Data(bytes)
-        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
-        return CGImage(
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bitsPerPixel: 32,
-            bytesPerRow: bytesPerRow,
-            space: colorSpace,
-            bitmapInfo: bitmapInfo,
-            provider: provider,
-            decode: nil,
-            shouldInterpolate: true,
-            intent: .defaultIntent
-        )
-    }
-}
-
-private struct RGBAColor {
-    let red: UInt8
-    let green: UInt8
-    let blue: UInt8
-    let alpha: UInt8
-
-    init(_ color: NSColor) {
-        let color = color.usingColorSpace(.deviceRGB) ?? NSColor.controlAccentColor.usingColorSpace(.deviceRGB) ?? .systemBlue
-        red = Self.byte(color.redComponent)
-        green = Self.byte(color.greenComponent)
-        blue = Self.byte(color.blueComponent)
-        alpha = Self.byte(color.alphaComponent)
-    }
-
-    private static func byte(_ component: CGFloat) -> UInt8 {
-        UInt8(max(0, min(255, (component * 255).rounded())))
     }
 }

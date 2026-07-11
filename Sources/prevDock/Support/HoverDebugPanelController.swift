@@ -2,23 +2,26 @@ import ApplicationServices
 import Cocoa
 import CoreGraphics
 
-final class HoverDebugPanelController {
+final class HoverDebugPanelController: NSObject, NSWindowDelegate {
     private let panel: NSPanel
     private let textView = NSTextView()
     private var timer: Timer?
 
-    init() {
+    override init() {
         panel = NSPanel(
             contentRect: NSRect(x: 0, y: 0, width: 640, height: 460),
             styleMask: [.titled, .nonactivatingPanel, .closable],
             backing: .buffered,
             defer: false
         )
+        super.init()
+
         panel.title = "prevDock Hover Debug"
         panel.level = .floating
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         panel.hidesOnDeactivate = false
         panel.isReleasedWhenClosed = false
+        panel.delegate = self
 
         let scrollView = NSScrollView()
         scrollView.hasVerticalScroller = true
@@ -46,19 +49,28 @@ final class HoverDebugPanelController {
         panel.isVisible ? hide() : show()
     }
 
+    func windowWillClose(_ notification: Notification) {
+        stop()
+    }
+
     private func hide() {
         panel.orderOut(nil)
-        timer?.invalidate()
-        timer = nil
+        stop()
     }
 
     private func start() {
-        timer?.invalidate()
-        timer = Timer.scheduledTimer(withTimeInterval: 0.10, repeats: true) { [weak self] _ in
+        stop()
+        let timer = Timer(timeInterval: 0.10, repeats: true) { [weak self] _ in
             self?.refresh()
         }
-        RunLoop.main.add(timer!, forMode: .common)
+        self.timer = timer
+        RunLoop.main.add(timer, forMode: .common)
         refresh()
+    }
+
+    private func stop() {
+        timer?.invalidate()
+        timer = nil
     }
 
     private func positionPanel() {
@@ -112,7 +124,7 @@ private enum HoverDebugFormatter {
     }
 
     private static func formatScreen(containing mouse: CGPoint) -> String {
-        guard let screen = NSScreen.screens.first(where: { $0.frame.contains(mouse) }) ?? NSScreen.main else {
+        guard let screen = ScreenGeometry.screen(containing: mouse) ?? NSScreen.main else {
             return "  none"
         }
 

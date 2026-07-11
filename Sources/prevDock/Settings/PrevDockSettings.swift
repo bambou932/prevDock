@@ -72,6 +72,8 @@ enum PrevDockSettings {
     static let legacyDockContextClickPreviewEnabledKey = "dockContextClickPreviewEnabled"
     static let nativeDockLabelSuppressionEnabledKey = "nativeDockLabelSuppressionEnabled"
     static let launchAtLoginDefaultAppliedKey = "launchAtLoginDefaultApplied"
+    static let launchAtLoginDefaultPendingKey = "launchAtLoginDefaultPending"
+    static let permissionSetupShownKey = "permissionSetupShown"
     static let defaultPreviewSwitchDelay: TimeInterval = 0.3
     static let defaultPreviewOverflowMode = PreviewOverflowMode.scroll
     static let defaultPreviewContentSize = PreviewContentSize.regular
@@ -92,7 +94,9 @@ enum PrevDockSettings {
             previewDesktopGroupingEnabledKey: defaultPreviewDesktopGroupingEnabled,
             dockAppClickPreviewEnabledKey: defaultDockAppClickPreviewEnabled,
             nativeDockLabelSuppressionEnabledKey: defaultNativeDockLabelSuppressionEnabled,
-            launchAtLoginDefaultAppliedKey: false
+            launchAtLoginDefaultAppliedKey: false,
+            launchAtLoginDefaultPendingKey: false,
+            permissionSetupShownKey: false
         ])
     }
 
@@ -106,10 +110,10 @@ enum PrevDockSettings {
 
     static var previewSwitchDelay: TimeInterval {
         get {
-            clamp(UserDefaults.standard.double(forKey: previewSwitchDelayKey))
+            normalizedDelay(UserDefaults.standard.double(forKey: previewSwitchDelayKey))
         }
         set {
-            set(clamp(newValue), forKey: previewSwitchDelayKey)
+            set(normalizedDelay(newValue), replacing: previewSwitchDelay, forKey: previewSwitchDelayKey)
         }
     }
 
@@ -119,7 +123,7 @@ enum PrevDockSettings {
                 defaultPreviewOverflowMode
         }
         set {
-            set(newValue.rawValue, forKey: previewOverflowModeKey)
+            set(newValue.rawValue, replacing: previewOverflowMode.rawValue, forKey: previewOverflowModeKey)
         }
     }
 
@@ -129,7 +133,7 @@ enum PrevDockSettings {
                 defaultPreviewContentSize
         }
         set {
-            set(newValue.rawValue, forKey: previewContentSizeKey)
+            set(newValue.rawValue, replacing: previewContentSize.rawValue, forKey: previewContentSizeKey)
         }
     }
 
@@ -139,7 +143,7 @@ enum PrevDockSettings {
                 defaultPreviewWindowHeight
         }
         set {
-            set(newValue.rawValue, forKey: previewWindowHeightKey)
+            set(newValue.rawValue, replacing: previewWindowHeight.rawValue, forKey: previewWindowHeightKey)
         }
     }
 
@@ -149,7 +153,7 @@ enum PrevDockSettings {
                 defaultPreviewCloseButtonEnabled
         }
         set {
-            set(newValue, forKey: previewCloseButtonEnabledKey)
+            set(newValue, replacing: previewCloseButtonEnabled, forKey: previewCloseButtonEnabledKey)
         }
     }
 
@@ -159,7 +163,7 @@ enum PrevDockSettings {
                 defaultPreviewDesktopGroupingEnabled
         }
         set {
-            set(newValue, forKey: previewDesktopGroupingEnabledKey)
+            set(newValue, replacing: previewDesktopGroupingEnabled, forKey: previewDesktopGroupingEnabledKey)
         }
     }
 
@@ -172,7 +176,7 @@ enum PrevDockSettings {
                 defaultDockAppClickPreviewEnabled
         }
         set {
-            set(newValue, forKey: dockAppClickPreviewEnabledKey)
+            set(newValue, replacing: dockAppClickPreviewEnabled, forKey: dockAppClickPreviewEnabledKey)
         }
     }
 
@@ -182,7 +186,7 @@ enum PrevDockSettings {
                 defaultNativeDockLabelSuppressionEnabled
         }
         set {
-            set(newValue, forKey: nativeDockLabelSuppressionEnabledKey)
+            set(newValue, replacing: nativeDockLabelSuppressionEnabled, forKey: nativeDockLabelSuppressionEnabledKey)
         }
     }
 
@@ -191,20 +195,42 @@ enum PrevDockSettings {
             UserDefaults.standard.object(forKey: launchAtLoginDefaultAppliedKey) as? Bool ?? false
         }
         set {
+            guard newValue != launchAtLoginDefaultApplied else { return }
             UserDefaults.standard.set(newValue, forKey: launchAtLoginDefaultAppliedKey)
         }
     }
 
+    static var permissionSetupShown: Bool {
+        get {
+            UserDefaults.standard.object(forKey: permissionSetupShownKey) as? Bool ?? false
+        }
+        set {
+            guard newValue != permissionSetupShown else { return }
+            UserDefaults.standard.set(newValue, forKey: permissionSetupShownKey)
+        }
+    }
+
+    static var launchAtLoginDefaultPending: Bool {
+        get {
+            UserDefaults.standard.object(forKey: launchAtLoginDefaultPendingKey) as? Bool ?? false
+        }
+        set {
+            guard newValue != launchAtLoginDefaultPending else { return }
+            UserDefaults.standard.set(newValue, forKey: launchAtLoginDefaultPendingKey)
+        }
+    }
+
     static func formattedDelay(_ value: TimeInterval) -> String {
-        let clamped = clamp(value)
+        let clamped = normalizedDelay(value)
         if clamped <= 0.01 {
             return "Instant"
         }
         return String(format: "%.2f s", clamped)
     }
 
-    private static func clamp(_ value: TimeInterval) -> TimeInterval {
-        min(max(value, previewSwitchDelayRange.lowerBound), previewSwitchDelayRange.upperBound)
+    private static func normalizedDelay(_ value: TimeInterval) -> TimeInterval {
+        guard value.isFinite else { return defaultPreviewSwitchDelay }
+        return min(max(value, previewSwitchDelayRange.lowerBound), previewSwitchDelayRange.upperBound)
     }
 
     private static func persistedBool(forKey key: String) -> Bool? {
@@ -215,8 +241,9 @@ enum PrevDockSettings {
         return domain[key] as? Bool
     }
 
-    private static func set(_ value: Any, forKey key: String) {
+    private static func set<Value: Equatable>(_ value: Value, replacing currentValue: Value, forKey key: String) {
+        guard value != currentValue else { return }
         UserDefaults.standard.set(value, forKey: key)
-        NotificationCenter.default.post(name: didChangeNotification, object: nil)
+        NotificationCenter.default.post(name: didChangeNotification, object: key)
     }
 }

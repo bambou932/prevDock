@@ -7,6 +7,20 @@ final class UpdateController: NSObject {
         updaterDelegate: nil,
         userDriverDelegate: nil
     )
+    private var canCheckForUpdatesObservation: NSKeyValueObservation?
+    var stateDidChange: (() -> Void)?
+
+    override init() {
+        super.init()
+        canCheckForUpdatesObservation = updaterController.updater.observe(
+            \.canCheckForUpdates,
+            options: [.new]
+        ) { [weak self] _, _ in
+            DispatchQueue.main.async {
+                self?.stateDidChange?()
+            }
+        }
+    }
 
     var currentVersionText: String {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.1.0"
@@ -48,12 +62,6 @@ final class UpdateController: NSObject {
     }
 
     @objc func checkForUpdates(_ sender: Any?) {
-        enableAutomaticInstallForThisCheck()
         updaterController.checkForUpdates(sender)
-    }
-
-    private func enableAutomaticInstallForThisCheck() {
-        guard updaterController.updater.allowsAutomaticUpdates else { return }
-        updaterController.updater.automaticallyDownloadsUpdates = true
     }
 }
