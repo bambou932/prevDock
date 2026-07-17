@@ -10,8 +10,14 @@ struct CGSWindowCaptureOptions: OptionSet {
     let rawValue: UInt32
 
     static let bestResolution = CGSWindowCaptureOptions(rawValue: 1 << 8)
+    static let nominalResolution = CGSWindowCaptureOptions(rawValue: 1 << 9)
     static let ignoreGlobalClipShape = CGSWindowCaptureOptions(rawValue: 1 << 11)
     static let fullSize = CGSWindowCaptureOptions(rawValue: 1 << 19)
+}
+
+enum SkyLightWindowCaptureResolution {
+    case nominal
+    case best
 }
 
 struct CGSSpaceMask: OptionSet {
@@ -23,9 +29,18 @@ struct CGSSpaceMask: OptionSet {
 }
 
 enum SkyLightCapture {
-    static func capture(windowID: CGWindowID) -> CGImage? {
+    static func capture(
+        windowID: CGWindowID,
+        resolution: SkyLightWindowCaptureResolution = .best
+    ) -> CGImage? {
         var id = windowID
-        let options: CGSWindowCaptureOptions = [.ignoreGlobalClipShape, .bestResolution, .fullSize]
+        var options: CGSWindowCaptureOptions = [.ignoreGlobalClipShape, .fullSize]
+        switch resolution {
+        case .nominal:
+            options.insert(.nominalResolution)
+        case .best:
+            options.insert(.bestResolution)
+        }
         guard let result = CGSHWCaptureWindowList(skyLightConnection, &id, 1, options),
               let images = result.takeRetainedValue() as? [CGImage] else {
             return nil
@@ -57,9 +72,13 @@ enum SkyLightCapture {
     }
 
     static func spaceIDs(windowID: CGWindowID) -> [UInt64] {
+        spaceIDsIfAvailable(windowID: windowID) ?? []
+    }
+
+    static func spaceIDsIfAvailable(windowID: CGWindowID) -> [UInt64]? {
         let windows = [NSNumber(value: windowID)] as CFArray
         let mask: CGSSpaceMask = [.current, .others, .user]
-        guard let result = CGSCopySpacesForWindows(skyLightConnection, mask, windows) else { return [] }
+        guard let result = CGSCopySpacesForWindows(skyLightConnection, mask, windows) else { return nil }
         let spaces = result.takeRetainedValue() as NSArray
         return spaces.compactMap { ($0 as? NSNumber)?.uint64Value }
     }

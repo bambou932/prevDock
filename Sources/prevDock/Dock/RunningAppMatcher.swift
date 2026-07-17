@@ -2,16 +2,14 @@ import Cocoa
 
 enum RunningAppMatcher {
     static func matchDockItem(title: String?, url: URL?) -> NSRunningApplication? {
-        let apps = regularApps
-
         if let url, isApplicationURL(url) {
-            let result = matchApplication(at: url, among: apps)
+            let result = matchApplication(at: url)
             if let app = result.app { return app }
             if result.isAuthoritative { return nil }
         }
 
         guard let title, !title.isEmpty else { return nil }
-        return matchDockTitle(title, among: apps)
+        return matchDockTitle(title, among: regularApps)
     }
 
     static func matchDockTitle(_ title: String) -> NSRunningApplication? {
@@ -47,20 +45,29 @@ enum RunningAppMatcher {
         return fuzzyMatches[0]
     }
 
-    private static func matchApplication(
-        at dockURL: URL,
-        among apps: [NSRunningApplication]
-    ) -> (app: NSRunningApplication?, isAuthoritative: Bool) {
-        let pathMatches = apps.filter { bundleURL($0, matches: dockURL) }
-        if !pathMatches.isEmpty {
-            return (preferredApplication(from: pathMatches), true)
+    private static func matchApplication(at dockURL: URL) -> (app: NSRunningApplication?, isAuthoritative: Bool) {
+        if let bundleIdentifier = Bundle(url: dockURL)?.bundleIdentifier {
+            let identifierMatches = NSRunningApplication
+                .runningApplications(withBundleIdentifier: bundleIdentifier)
+                .filter(isMatchableApplication)
+            guard identifierMatches.count != 1 else {
+                return (identifierMatches[0], true)
+            }
+            let pathMatches = identifierMatches.filter { bundleURL($0, matches: dockURL) }
+            return (
+                preferredApplication(from: pathMatches.isEmpty ? identifierMatches : pathMatches),
+                true
+            )
         }
 
-        guard let bundleIdentifier = Bundle(url: dockURL)?.bundleIdentifier else {
-            return (nil, false)
-        }
-        let identifierMatches = apps.filter { $0.bundleIdentifier == bundleIdentifier }
-        return (preferredApplication(from: identifierMatches), true)
+        let pathMatches = regularApps.filter { bundleURL($0, matches: dockURL) }
+        return (preferredApplication(from: pathMatches), !pathMatches.isEmpty)
+    }
+
+    private static func isMatchableApplication(_ app: NSRunningApplication) -> Bool {
+        app.activationPolicy == .regular &&
+            app.bundleIdentifier != Bundle.main.bundleIdentifier &&
+            !app.isTerminated
     }
 
     private static func preferredApplication(

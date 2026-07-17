@@ -312,6 +312,7 @@ final class PreviewCardView: NSView {
     private var actionFeedbackGeneration = 0
     private var isClosing = false
     private var isHovered = false
+    private var isThumbnailUnavailable = false
     private var initialHoverGate: InitialHoverActivationGate
     private var highlightCornerRadius: CGFloat = 10
     private var highlightCornerRadiusKey: PreviewHighlightCornerRadiusKey?
@@ -359,6 +360,10 @@ final class PreviewCardView: NSView {
 
     override var intrinsicContentSize: NSSize {
         cardSize
+    }
+
+    var canReuseForPresentation: Bool {
+        !isClosing
     }
 
     static func cardSize(for preview: WindowPreview, imageHeight: CGFloat) -> NSSize {
@@ -431,6 +436,8 @@ final class PreviewCardView: NSView {
 
     func updateImage(_ image: NSImage, animated: Bool = true) {
         preview = preview.replacingImage(with: image)
+        isThumbnailUnavailable = false
+        updateThumbnailAccessibility()
         if let currentImage = imageView.image, currentImage === image {
             updateImageBackground()
             return
@@ -445,6 +452,11 @@ final class PreviewCardView: NSView {
     }
 
     func updatePreview(_ preview: WindowPreview) {
+        let shouldResetThumbnailFailure = self.preview.isMinimized != preview.isMinimized ||
+            self.preview.bounds.size != preview.bounds.size
+        if shouldResetThumbnailFailure {
+            isThumbnailUnavailable = false
+        }
         self.preview = preview
         titleLabel?.stringValue = preview.title
         if !isClosing, actionFeedbackWorkItem == nil {
@@ -453,10 +465,29 @@ final class PreviewCardView: NSView {
         if let image = preview.image {
             updateImage(image)
         } else {
-            updateImageBackground()
+            showThumbnailPlaceholder()
         }
         if isHovered, !isClosing {
             WindowPeekController.shared.show(preview: preview)
+        }
+        updateThumbnailAccessibility()
+    }
+
+    func markThumbnailUnavailable() {
+        guard preview.image == nil, !isThumbnailUnavailable else { return }
+        isThumbnailUnavailable = true
+        showThumbnailPlaceholder()
+        updateThumbnailAccessibility()
+    }
+
+    func prepareForPanelPresentation(initialHoverSuppressionPoint: CGPoint?) {
+        peekWorkItem?.cancel()
+        hoverExitWorkItem?.cancel()
+        initialHoverGate = InitialHoverActivationGate(
+            suppressionPoint: initialHoverSuppressionPoint
+        )
+        if isHovered {
+            deactivateHover()
         }
     }
 
@@ -616,6 +647,7 @@ final class PreviewCardView: NSView {
         self.statusLabel = statusLabel
         addSubviews(titleLabel: titleLabel, statusLabel: statusLabel)
         installConstraints(titleLabel: titleLabel, statusLabel: statusLabel)
+        configureAccessibility()
         if keepsSampleCloseButtonVisible {
             setCloseButtonVisible(true)
         }
@@ -623,6 +655,26 @@ final class PreviewCardView: NSView {
 
     private var isInteractive: Bool {
         interactionMode == .live
+    }
+
+    private func configureAccessibility() {
+        setAccessibilityElement(true)
+        setAccessibilityRole(.group)
+        setAccessibilityIdentifier("prevDock.previewCard.\(preview.windowID)")
+        updateThumbnailAccessibility()
+    }
+
+    private func updateThumbnailAccessibility() {
+        setAccessibilityLabel(preview.title)
+        let value: String
+        if preview.image != nil {
+            value = "Ready"
+        } else if isThumbnailUnavailable {
+            value = "Unavailable"
+        } else {
+            value = "Loading"
+        }
+        setAccessibilityValue(value)
     }
 
     private func contains(screenPoint: CGPoint) -> Bool {
@@ -691,15 +743,27 @@ final class PreviewCardView: NSView {
         imageView.image = preview.image
         imageView.imageScaling = .scaleProportionallyUpOrDown
         imageView.wantsLayer = true
+        imageView.layer?.masksToBounds = true
         updateImageBackground()
         if preview.image == nil {
-            let loadingView = ThumbnailLoadingView()
-            imageView.addSubview(loadingView)
-            NSLayoutConstraint.activate([
-                loadingView.centerXAnchor.constraint(equalTo: imageView.centerXAnchor),
-                loadingView.centerYAnchor.constraint(equalTo: imageView.centerYAnchor)
-            ])
+            showThumbnailPlaceholder()
         }
+    }
+
+    private func showThumbnailPlaceholder() {
+        imageView.image = nil
+        imageView.subviews.forEach { $0.removeFromSuperview() }
+        let placeholder: NSView = isThumbnailUnavailable ?
+            ThumbnailUnavailableView(appIcon: preview.app.icon) : ThumbnailLoadingView()
+        imageView.addSubview(placeholder)
+        NSLayoutConstraint.activate([
+            placeholder.centerXAnchor.constraint(equalTo: imageView.centerXAnchor),
+            placeholder.centerYAnchor.constraint(equalTo: imageView.centerYAnchor),
+            placeholder.leadingAnchor.constraint(greaterThanOrEqualTo: imageView.leadingAnchor, constant: 4),
+            placeholder.trailingAnchor.constraint(lessThanOrEqualTo: imageView.trailingAnchor, constant: -4)
+        ])
+        updateImageBackground()
+        updateHighlightCornerRadius(for: nil)
     }
 
     private func updateImageBackground() {
@@ -1270,8 +1334,56 @@ final class ThumbnailLoadingView: NSView {
         NSLayoutConstraint.activate([
             label.centerXAnchor.constraint(equalTo: centerXAnchor),
             label.centerYAnchor.constraint(equalTo: centerYAnchor),
-            widthAnchor.constraint(equalToConstant: 140),
+            label.leadingAnchor.constraint(equalTo: leadingAnchor),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor),
             heightAnchor.constraint(equalToConstant: 28)
+        ])
+    }
+}
+
+final class ThumbnailUnavailableView: NSView {
+    private let appIcon: NSImage?
+
+    init(appIcon: NSImage?) {
+        self.appIcon = appIcon
+        super.init(frame: .zero)
+        build()
+    }
+
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) has not been implemented")
+    }
+
+    override var intrinsicContentSize: NSSize {
+        NSSize(width: 160, height: 58)
+    }
+
+    private func build() {
+        let iconView = NSImageView()
+        iconView.image = appIcon
+        iconView.imageScaling = .scaleProportionallyUpOrDown
+        iconView.alphaValue = 0.68
+        let label = NSTextField(labelWithString: "Preview unavailable")
+        label.font = .systemFont(ofSize: 11, weight: .medium)
+        label.textColor = NSColor.white.withAlphaComponent(0.62)
+        label.alignment = .center
+        label.lineBreakMode = .byTruncatingTail
+
+        addSubview(iconView)
+        addSubview(label)
+        iconView.translatesAutoresizingMaskIntoConstraints = false
+        label.translatesAutoresizingMaskIntoConstraints = false
+        translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            heightAnchor.constraint(equalToConstant: 58),
+            iconView.centerXAnchor.constraint(equalTo: centerXAnchor),
+            iconView.topAnchor.constraint(equalTo: topAnchor),
+            iconView.widthAnchor.constraint(equalToConstant: 32),
+            iconView.heightAnchor.constraint(equalToConstant: 32),
+            label.leadingAnchor.constraint(equalTo: leadingAnchor),
+            label.trailingAnchor.constraint(equalTo: trailingAnchor),
+            label.topAnchor.constraint(equalTo: iconView.bottomAnchor, constant: 4),
+            label.bottomAnchor.constraint(equalTo: bottomAnchor)
         ])
     }
 }

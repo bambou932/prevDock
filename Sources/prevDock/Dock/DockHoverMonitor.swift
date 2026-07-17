@@ -8,17 +8,27 @@ final class DockHoverMonitor {
     private var settingsObserver: NSObjectProtocol?
     private var spaceObserver: NSObjectProtocol?
     private var eventMonitors = [Any]()
+    private var globalMouseMovedMonitor: Any?
     private var mouseDownEventTap: CFMachPort?
     private var mouseDownEventTapSource: CFRunLoopSource?
     private var lastEventTapInstallAttempt: TimeInterval = 0
+    private var lastMouseMovedMonitorInstallAttempt: TimeInterval = 0
     private var lastTargetKey: String?
     private var lastMetadataRefresh = Date.distantPast
+    private var spaceChangeGeneration: UInt64 = 0
+    private var metadataSpaceGenerationByPID = [pid_t: UInt64]()
     private var lastLiveThumbnailRefresh = Date.distantPast
     private var lastAnchor: CGRect?
     private var hoverExitStartedAt: Date?
     private var pendingTarget: DockHoverTarget?
     private var pendingTargetStartedAt = Date.distantPast
     private var lastWarmupByPID = [pid_t: Date]()
+    private var metadataRefresh: PendingWindowRefresh?
+    private var warmupRefresh: PendingWindowRefresh?
+    private var clickValidationRefresh: PendingWindowRefresh?
+    private var thumbnailTargetPID: pid_t?
+    private var thumbnailRefreshGeneration: UInt64 = 0
+    private var nextRefreshIdentifier: UInt64 = 0
     private var cachedHoverTarget: DockHoverTarget?
     private var cachedHoverTargetResolvedAt: TimeInterval = 0
     private var cachedHoverResolutionPoint = CGPoint.zero
@@ -47,9 +57,15 @@ final class DockHoverMonitor {
 
     func start() {
         dockClickActionGeneration &+= 1
+        cancelRefreshRequests()
+        thumbnailTargetPID = nil
+        thumbnailRefreshGeneration &+= 1
+        WindowInventory.setBackgroundThumbnailTarget(pid: nil)
         timer?.invalidate()
         eventMonitors.forEach(NSEvent.removeMonitor)
         eventMonitors.removeAll()
+        globalMouseMovedMonitor = nil
+        lastMouseMovedMonitorInstallAttempt = 0
         uninstallMouseDownEventTap()
 
         installMouseDownEventTap(force: true)
@@ -64,6 +80,8 @@ final class DockHoverMonitor {
     }
 
     deinit {
+        cancelRefreshRequests()
+        WindowInventory.setBackgroundThumbnailTarget(pid: nil)
         timer?.invalidate()
         eventMonitors.forEach(NSEvent.removeMonitor)
         uninstallMouseDownEventTap()
@@ -79,6 +97,7 @@ final class DockHoverMonitor {
         timer?.invalidate()
         timer = nil
         repairMouseDownEventTapIfNeeded()
+        repairMouseMovedMonitorIfNeeded()
 
         defer {
             scheduleNextTickIfNeeded()
@@ -118,9 +137,7 @@ final class DockHoverMonitor {
         }
 
         guard AXIsProcessTrusted() else {
-            previewController?.hide()
-            labelController?.hide()
-            clearPendingTarget()
+            hideAndResetHover()
             return
         }
 
@@ -137,6 +154,8 @@ final class DockHoverMonitor {
         }
 
         clearHoverExitGrace()
+        cancelRefreshRequests(except: rawTarget.key)
+        setThumbnailTargetPID(rawTarget.app?.processIdentifier)
         warmPreviewCacheIfNeeded(for: rawTarget, now: now)
         guard let target = targetAfterSwitchDelay(rawTarget, now: now) else {
             return
@@ -172,12 +191,15 @@ final class DockHoverMonitor {
             for: app,
             refreshedWithin: 1.0
         ) : nil
-        let needsMetadata = needsPresentation ?
-            freshCachedPreviews == nil : now.timeIntervalSince(lastMetadataRefresh) > 1.0
+        let pid = app.processIdentifier
+        let needsSpaceRefresh = metadataSpaceGenerationByPID[pid, default: 0] != spaceChangeGeneration
+        let needsMetadata = needsSpaceRefresh || (needsPresentation ?
+            freshCachedPreviews == nil : now.timeIntervalSince(lastMetadataRefresh) > 1.0)
         let needsLiveThumbnails = panelVisible &&
             now.timeIntervalSince(lastLiveThumbnailRefresh) > liveThumbnailRefreshInterval
         guard needsPresentation || needsMetadata || needsLiveThumbnails else { return }
 
+        var presentedCachedPreviews = false
         if needsPresentation {
             let cached = freshCachedPreviews ?? WindowInventory.cachedWindows(for: app)
             if cached.isEmpty {
@@ -186,37 +208,22 @@ final class DockHoverMonitor {
                 }
             } else {
                 previewController?.show(previews: cached, app: app, anchoredTo: lastAnchor ?? target.anchor)
+                presentedCachedPreviews = true
             }
             if freshCachedPreviews != nil {
                 lastMetadataRefresh = now
             }
         }
 
-        if needsMetadata {
-            lastMetadataRefresh = now
-        }
         if needsLiveThumbnails {
             lastLiveThumbnailRefresh = now
         }
 
         let expectedTargetKey = target.key
         if needsMetadata {
-            WindowInventory.refreshWindows(
-                for: app,
-                thumbnailPolicy: needsLiveThumbnails ? .refreshStale : .missingOnly
-            ) { [weak self, weak app] previews in
-                guard let self else { return }
-                guard let app, self.lastTargetKey == expectedTargetKey else { return }
-                self.previewController?.show(previews: previews, app: app, anchoredTo: self.lastAnchor ?? target.anchor)
-            } thumbnail: { [weak self, weak app] windowID, image in
-                guard let self, app != nil, self.lastTargetKey == expectedTargetKey else { return }
-                self.previewController?.updateThumbnail(windowID: windowID, image: image)
-            }
-        } else if needsLiveThumbnails {
-            WindowInventory.refreshThumbnails(for: app) { [weak self, weak app] windowID, image in
-                guard let self, app != nil, self.lastTargetKey == expectedTargetKey else { return }
-                self.previewController?.updateThumbnail(windowID: windowID, image: image)
-            }
+            refreshMetadata(for: app, target: target)
+        } else if needsLiveThumbnails || presentedCachedPreviews {
+            refreshPreviewThumbnails(for: app, expectedTargetKey: expectedTargetKey, now: now)
         }
     }
 
@@ -229,37 +236,90 @@ final class DockHoverMonitor {
             return
         }
 
+        refreshPreviewThumbnails(for: app, expectedTargetKey: expectedTargetKey, now: now)
+    }
+
+    private func refreshPreviewThumbnails(
+        for app: NSRunningApplication,
+        expectedTargetKey: String,
+        now: Date = Date()
+    ) {
         lastLiveThumbnailRefresh = now
-        WindowInventory.refreshThumbnails(for: app) { [weak self, weak app] windowID, image in
+        let generation = thumbnailRefreshGeneration
+        WindowInventory.refreshThumbnails(
+            for: app,
+            maximumStaleCount: 2
+        ) { [weak self, weak app] windowID, result in
             guard let self,
                   app != nil,
+                  self.thumbnailRefreshGeneration == generation,
                   self.lastTargetKey == expectedTargetKey,
                   self.previewController?.isVisible == true else {
                 return
             }
-            self.previewController?.updateThumbnail(windowID: windowID, image: image)
+            if let image = result.image {
+                self.previewController?.updateThumbnail(windowID: windowID, image: image)
+            } else {
+                self.previewController?.markThumbnailUnavailable(windowID: windowID)
+            }
         }
+    }
+
+    private func refreshMetadata(for app: NSRunningApplication, target: DockHoverTarget) {
+        guard metadataRefresh == nil,
+              clickValidationRefresh?.targetKey != target.key else {
+            return
+        }
+        let expectedTargetKey = target.key
+        let refreshIdentifier = makeRefreshIdentifier()
+        let request = WindowInventory.refreshWindows(
+            for: app,
+            thumbnailPolicy: .none
+        ) { [weak self, weak app] previews in
+            guard let self else { return }
+            guard self.consumeMetadataRefresh(identifier: refreshIdentifier) else { return }
+            guard let app, self.lastTargetKey == expectedTargetKey else { return }
+            self.didCompleteMetadataRefresh(for: app.processIdentifier)
+            self.previewController?.show(
+                previews: previews,
+                app: app,
+                anchoredTo: self.lastAnchor ?? target.anchor
+            )
+            self.refreshPreviewThumbnails(for: app, expectedTargetKey: expectedTargetKey)
+        } thumbnail: { _, _ in }
+        metadataRefresh = PendingWindowRefresh(
+            targetKey: expectedTargetKey,
+            pid: app.processIdentifier,
+            identifier: refreshIdentifier,
+            request: request
+        )
     }
 
     private func warmPreviewCacheIfNeeded(for target: DockHoverTarget, now: Date) {
         guard let app = target.app else { return }
         let switchDelay = PrevDockSettings.previewSwitchDelay
-        if switchDelay > 0 {
-            let warmupDelay = min(switchDelay, fastTickInterval)
-            guard pendingTarget?.key == target.key,
-                  now.timeIntervalSince(pendingTargetStartedAt) >= warmupDelay else {
-                return
-            }
-        }
-        guard WindowInventory.cachedWindows(
-            for: app,
-            refreshedWithin: previewWarmupInterval
-        ) == nil else {
+        guard switchDelay > 0 else { return }
+        let warmupDelay = min(switchDelay, fastTickInterval)
+        guard pendingTarget?.key == target.key,
+              now.timeIntervalSince(pendingTargetStartedAt) >= warmupDelay else {
             return
+        }
+        if let warmupRefresh {
+            guard warmupRefresh.targetKey != target.key else { return }
+            warmupRefresh.request.cancel()
+            self.warmupRefresh = nil
         }
         let pid = app.processIdentifier
-        guard now.timeIntervalSince(lastWarmupByPID[pid, default: .distantPast]) > previewWarmupInterval else {
-            return
+        let spaceGeneration = spaceChangeGeneration
+        let needsSpaceRefresh = metadataSpaceGenerationByPID[pid, default: 0] != spaceGeneration
+        if !needsSpaceRefresh {
+            guard WindowInventory.cachedWindows(
+                for: app,
+                refreshedWithin: previewWarmupInterval
+            ) == nil,
+            now.timeIntervalSince(lastWarmupByPID[pid, default: .distantPast]) > previewWarmupInterval else {
+                return
+            }
         }
 
         lastWarmupByPID[pid] = now
@@ -268,7 +328,22 @@ final class DockHoverMonitor {
                 now.timeIntervalSince($0.value) <= previewWarmupInterval
             }
         }
-        WindowInventory.warmPreviewCache(for: app)
+        let refreshIdentifier = makeRefreshIdentifier()
+        let request = WindowInventory.warmPreviewCache(for: app) { [weak self] _ in
+            guard let self,
+                  self.warmupRefresh?.identifier == refreshIdentifier else {
+                return
+            }
+            self.warmupRefresh = nil
+            guard self.spaceChangeGeneration == spaceGeneration else { return }
+            self.metadataSpaceGenerationByPID[pid] = spaceGeneration
+        }
+        warmupRefresh = PendingWindowRefresh(
+            targetKey: target.key,
+            pid: app.processIdentifier,
+            identifier: refreshIdentifier,
+            request: request
+        )
     }
 
     private var isMouseButtonPressed: Bool {
@@ -276,6 +351,11 @@ final class DockHoverMonitor {
     }
 
     private func installMouseEventMonitors() {
+        installMouseDownEventMonitors()
+        installMouseMovedEventMonitors()
+    }
+
+    private func installMouseDownEventMonitors() {
         let mask: NSEvent.EventTypeMask = [.leftMouseDown, .rightMouseDown, .otherMouseDown]
 
         if let global = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] event in
@@ -294,6 +374,39 @@ final class DockHoverMonitor {
         }
     }
 
+    private func installMouseMovedEventMonitors() {
+        let mask: NSEvent.EventTypeMask = [.mouseMoved]
+
+        installGlobalMouseMovedMonitorIfNeeded(mask: mask)
+
+        if let local = NSEvent.addLocalMonitorForEvents(matching: mask, handler: { [weak self] event in
+            self?.handleMouseMoved()
+            return event
+        }) {
+            eventMonitors.append(local)
+        }
+    }
+
+    private func installGlobalMouseMovedMonitorIfNeeded(
+        mask: NSEvent.EventTypeMask = [.mouseMoved]
+    ) {
+        guard globalMouseMovedMonitor == nil else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastMouseMovedMonitorInstallAttempt >= 1 else { return }
+        lastMouseMovedMonitorInstallAttempt = now
+        guard let monitor = NSEvent.addGlobalMonitorForEvents(matching: mask, handler: { [weak self] _ in
+            self?.handleMouseMoved()
+        }) else {
+            return
+        }
+        globalMouseMovedMonitor = monitor
+        eventMonitors.append(monitor)
+    }
+
+    private func repairMouseMovedMonitorIfNeeded() {
+        installGlobalMouseMovedMonitorIfNeeded()
+    }
+
     private func installMouseDownEventTap(force: Bool = false) {
         let now = ProcessInfo.processInfo.systemUptime
         guard force || now - lastEventTapInstallAttempt >= 5 else { return }
@@ -306,8 +419,7 @@ final class DockHoverMonitor {
             CGEventMask(1 << CGEventType.rightMouseUp.rawValue) |
             CGEventMask(1 << CGEventType.otherMouseUp.rawValue) |
             CGEventMask(1 << CGEventType.rightMouseDragged.rawValue) |
-            CGEventMask(1 << CGEventType.otherMouseDragged.rawValue) |
-            CGEventMask(1 << CGEventType.mouseMoved.rawValue)
+            CGEventMask(1 << CGEventType.otherMouseDragged.rawValue)
         let refcon = Unmanaged.passUnretained(self).toOpaque()
         guard let tap = CGEvent.tapCreate(
             tap: .cgSessionEventTap,
@@ -347,7 +459,7 @@ final class DockHoverMonitor {
         }
         guard !CFMachPortIsValid(tap) || !CGEvent.tapIsEnabled(tap: tap) else { return }
         uninstallMouseDownEventTap()
-        installMouseDownEventTap()
+        installMouseDownEventTap(force: true)
     }
 
     private static let mouseDownEventCallback: CGEventTapCallBack = { _, type, event, refcon in
@@ -358,11 +470,6 @@ final class DockHoverMonitor {
             if let tap = monitor.mouseDownEventTap {
                 CGEvent.tapEnable(tap: tap, enable: true)
             }
-            return Unmanaged.passUnretained(event)
-        }
-
-        if type == .mouseMoved {
-            DockCursorTracker.shared.updateFromEventTap(quartzPoint: event.location)
             monitor.wakeForMouseMoved()
             return Unmanaged.passUnretained(event)
         }
@@ -414,8 +521,12 @@ final class DockHoverMonitor {
 
     private func handleActiveSpaceChange() {
         dockClickActionGeneration &+= 1
+        spaceChangeGeneration &+= 1
+        cancelClickValidationRefresh()
         clearCachedHoverTarget()
         hideAndResetHover()
+        WindowInventory.resetThumbnailFailuresForSpaceChange()
+        wakeForMouseMoved()
     }
 
     private func handleSettingsChange(key: String?) {
@@ -443,6 +554,11 @@ final class DockHoverMonitor {
             fallbackMouse: DockCursorTracker.shared.currentMouseLocation(),
             canSuppressDefault: false
         )
+    }
+
+    private func handleMouseMoved() {
+        DockCursorTracker.shared.updateFromAppKitPoint(NSEvent.mouseLocation)
+        wakeForMouseMoved()
     }
 
     private func handleMouseDownFromEventTap(
@@ -489,6 +605,7 @@ final class DockHoverMonitor {
             scheduleNextTickIfNeeded()
         }
 
+        cancelClickValidationRefresh()
         dockClickActionGeneration &+= 1
         suppression.prepareForMouseDown(kind: kind)
         let dockTarget = dockTargetUnderMouseDown(eventMouse: mouse, trackedMouse: fallbackMouse)
@@ -574,6 +691,8 @@ final class DockHoverMonitor {
         previews: [WindowPreview],
         actionGeneration: Int
     ) {
+        cancelRefreshRequests(except: target.key)
+        setThumbnailTargetPID(app.processIdentifier)
         clearPendingTarget()
         labelController?.hide()
         lastTargetKey = target.key
@@ -586,16 +705,17 @@ final class DockHoverMonitor {
         lastLiveThumbnailRefresh = now
 
         let expectedTargetKey = target.key
-        let actionStartedAt = Date()
         let frontmostPIDAtAction = NSWorkspace.shared.frontmostApplication?.processIdentifier
-        WindowInventory.refreshWindows(
+        let refreshIdentifier = makeRefreshIdentifier()
+        let request = WindowInventory.refreshWindows(
             for: app,
-            thumbnailPolicy: .refreshStale
+            thumbnailPolicy: .none
         ) { [weak self, weak app] previews in
             guard let self, let app else { return }
+            guard self.consumeClickValidationRefresh(identifier: refreshIdentifier) else { return }
+            self.didCompleteMetadataRefresh(for: app.processIdentifier)
             guard previews.count >= 2 else {
                 let shouldRestoreClick = self.dockClickActionGeneration == actionGeneration &&
-                    Date().timeIntervalSince(actionStartedAt) <= 0.75 &&
                     NSWorkspace.shared.frontmostApplication?.processIdentifier == frontmostPIDAtAction
                 if self.lastTargetKey == expectedTargetKey {
                     self.hideAndResetHover()
@@ -607,10 +727,23 @@ final class DockHoverMonitor {
             }
             guard self.lastTargetKey == expectedTargetKey else { return }
             self.previewController?.show(previews: previews, app: app, anchoredTo: target.anchor)
-        } thumbnail: { [weak self, weak app] windowID, image in
-            guard let self, app != nil, self.lastTargetKey == expectedTargetKey else { return }
-            self.previewController?.updateThumbnail(windowID: windowID, image: image)
-        }
+            self.refreshPreviewThumbnails(for: app, expectedTargetKey: expectedTargetKey)
+        } thumbnail: { _, _ in }
+        clickValidationRefresh = PendingWindowRefresh(
+            targetKey: expectedTargetKey,
+            pid: app.processIdentifier,
+            identifier: refreshIdentifier,
+            request: request
+        )
+        metadataRefresh?.request.cancel()
+        metadataRefresh = nil
+        expireClickValidationRefresh(
+            identifier: refreshIdentifier,
+            targetKey: expectedTargetKey,
+            app: app,
+            actionGeneration: actionGeneration,
+            frontmostPIDAtAction: frontmostPIDAtAction
+        )
     }
 
     private func restoreSuppressedDockClick(for app: NSRunningApplication) {
@@ -725,6 +858,8 @@ final class DockHoverMonitor {
     }
 
     private func hideAndResetHover() {
+        cancelRefreshRequests()
+        setThumbnailTargetPID(nil)
         previewController?.hide()
         labelController?.hide()
         clearHoverExitGrace()
@@ -733,6 +868,85 @@ final class DockHoverMonitor {
         lastTargetKey = nil
         lastAnchor = nil
         suppression.clearClickPreviewHold()
+    }
+
+    private func cancelRefreshRequests(except targetKey: String? = nil) {
+        if metadataRefresh?.targetKey != targetKey {
+            metadataRefresh?.request.cancel()
+            metadataRefresh = nil
+        }
+        if let pendingWarmup = warmupRefresh, pendingWarmup.targetKey != targetKey {
+            let wasActive = pendingWarmup.request.isActive
+            pendingWarmup.request.cancel()
+            if wasActive {
+                lastWarmupByPID.removeValue(forKey: pendingWarmup.pid)
+            }
+            warmupRefresh = nil
+        }
+        if clickValidationRefresh?.targetKey != targetKey {
+            cancelClickValidationRefresh()
+        }
+    }
+
+    private func setThumbnailTargetPID(_ pid: pid_t?) {
+        guard thumbnailTargetPID != pid else { return }
+        thumbnailTargetPID = pid
+        thumbnailRefreshGeneration &+= 1
+        WindowInventory.setBackgroundThumbnailTarget(pid: pid)
+    }
+
+    private func consumeMetadataRefresh(identifier: UInt64) -> Bool {
+        guard metadataRefresh?.identifier == identifier else { return false }
+        metadataRefresh = nil
+        return true
+    }
+
+    private func didCompleteMetadataRefresh(for pid: pid_t) {
+        lastMetadataRefresh = Date()
+        metadataSpaceGenerationByPID[pid] = spaceChangeGeneration
+    }
+
+    private func cancelClickValidationRefresh() {
+        clickValidationRefresh?.request.cancel()
+        clickValidationRefresh = nil
+    }
+
+    private func consumeClickValidationRefresh(identifier: UInt64) -> Bool {
+        guard clickValidationRefresh?.identifier == identifier else { return false }
+        clickValidationRefresh = nil
+        return true
+    }
+
+    private func expireClickValidationRefresh(
+        identifier: UInt64,
+        targetKey: String,
+        app: NSRunningApplication,
+        actionGeneration: Int,
+        frontmostPIDAtAction: pid_t?
+    ) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) { [weak self, weak app] in
+            guard let self,
+                  let app,
+                  let refresh = self.clickValidationRefresh,
+                  refresh.identifier == identifier else {
+                return
+            }
+            refresh.request.cancel()
+            self.clickValidationRefresh = nil
+            guard self.dockClickActionGeneration == actionGeneration,
+                  NSWorkspace.shared.frontmostApplication?.processIdentifier == frontmostPIDAtAction else {
+                return
+            }
+            if self.lastTargetKey == targetKey {
+                self.hideAndResetHover()
+            }
+            self.restoreSuppressedDockClick(for: app)
+        }
+    }
+
+    private func makeRefreshIdentifier() -> UInt64 {
+        nextRefreshIdentifier &+= 1
+        return nextRefreshIdentifier
     }
 
     private func targetAfterSwitchDelay(_ target: DockHoverTarget, now: Date) -> DockHoverTarget? {
@@ -891,10 +1105,6 @@ final class DockHoverMonitor {
     }
 
     private func nextTickInterval() -> TimeInterval? {
-        guard mouseDownEventTap != nil else {
-            return watchdogTickInterval
-        }
-
         if let hoverExitStartedAt {
             return max(0.01, previewHideGraceInterval - Date().timeIntervalSince(hoverExitStartedAt))
         }
@@ -907,6 +1117,10 @@ final class DockHoverMonitor {
             isMouseButtonPressed ||
             shouldHoldClickPreview() ||
             suppression.hasShortTimedState {
+            return fastTickInterval
+        }
+
+        if globalMouseMovedMonitor == nil {
             return fastTickInterval
         }
 
@@ -1190,4 +1404,11 @@ struct DockHoverTarget {
         }
         return "dock:\(title)"
     }
+}
+
+private struct PendingWindowRefresh {
+    let targetKey: String
+    let pid: pid_t
+    let identifier: UInt64
+    let request: WindowRefreshRequest
 }

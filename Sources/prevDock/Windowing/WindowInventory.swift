@@ -60,11 +60,13 @@ enum WindowInventory {
     private static let workQueue = DispatchQueue(label: "prevDock.window-inventory", qos: .userInitiated)
     private static let actionQueue = DispatchQueue(label: "prevDock.window-actions", qos: .userInteractive)
     private static let cachedPreviewsLock = NSLock()
+    private static let remoteWindowElementResolver = RemoteWindowElementResolver()
+    private static let refreshCoordinator = WindowRefreshCoordinator<pid_t, WindowRefreshCallbacks>()
     private static let captureQueue: OperationQueue = {
         let queue = OperationQueue()
         queue.name = "prevDock.window-capture"
         queue.qualityOfService = .userInitiated
-        queue.maxConcurrentOperationCount = 3
+        queue.maxConcurrentOperationCount = WindowThumbnailCapturePlan.maximumConcurrentCaptureCount
         return queue
     }()
     private static let liveCaptureQueue: OperationQueue = {
@@ -79,17 +81,18 @@ enum WindowInventory {
     private static var cachedMetadataRefreshedAtByPID = [pid_t: Date]()
     private static var cacheAccessByPID = [pid_t: Date]()
     private static var thumbnailsByWindow = [WindowCacheKey: ThumbnailCacheEntry]()
-    private static var inFlightRefreshes = Set<pid_t>()
     private static var inFlightCaptures = Set<WindowCaptureRequestKey>()
-    private static var refreshCallbacksByPID = [pid_t: [WindowRefreshCallbacks]]()
     // Multiple preview views can ask for the same window image during hover; keep one capture alive.
     private static var captureCompletionsByWindow = [WindowCaptureRequestKey: [(FreshThumbnailCaptureResult) -> Void]]()
+    private static var captureOperationsByRequest = [WindowCaptureRequestKey: Operation]()
+    private static var backgroundThumbnailTargetPID: pid_t?
     private static var captureInvalidationGenerationByWindow = [WindowCacheKey: UInt64]()
     private static var latestCaptureSequenceByWindow = [WindowCacheKey: UInt64]()
+    private static var thumbnailFailureBackoff = WindowThumbnailFailureBackoff<
+        WindowCacheKey,
+        WindowCaptureSignature
+    >()
     private static var nextCaptureSequence: UInt64 = 0
-    private static let remoteTokenFallbackScanLimit: UInt64 = 1000
-    private static let remoteTokenMaximumScanLimit: UInt64 = 20000
-    private static let remoteTokenScanPadding: UInt64 = 1000
     private static let thumbnailLiveRefreshMinimumAge: TimeInterval = 1.5
     private static let maximumCachedThumbnailPixelDimension = 1200
     private static let maximumCachedApplications = 8
@@ -106,6 +109,7 @@ enum WindowInventory {
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
                 return
             }
+            remoteWindowElementResolver.removeAll(for: app.processIdentifier)
             workQueue.async {
                 purgeCachedApplication(pid: app.processIdentifier)
             }
@@ -164,6 +168,7 @@ enum WindowInventory {
             let keys = Set(thumbnailsByWindow.keys)
                 .union(inFlightCaptures.map(\.cacheKey))
             thumbnailsByWindow.removeAll()
+            thumbnailFailureBackoff.removeAll()
             keys.forEach(invalidateCapture)
             previewsByPID = previewsByPID.mapValues { previews in
                 previews.map { $0.replacingImage(with: nil) }
@@ -174,12 +179,13 @@ enum WindowInventory {
         }
     }
 
+    @discardableResult
     static func refreshWindows(
         for app: NSRunningApplication,
-        thumbnailPolicy: WindowThumbnailRefreshPolicy = .missingOnly,
+        thumbnailPolicy: WindowThumbnailRefreshPolicy = .none,
         metadata: @escaping ([WindowPreview]) -> Void,
         thumbnail: @escaping (CGWindowID, NSImage) -> Void
-    ) {
+    ) -> WindowRefreshRequest {
         ensureApplicationTerminationObservation()
         let pid = app.processIdentifier
         let callbacks = WindowRefreshCallbacks(
@@ -187,60 +193,90 @@ enum WindowInventory {
             metadata: metadata,
             thumbnail: thumbnail
         )
-        workQueue.async {
-            refreshCallbacksByPID[pid, default: []].append(callbacks)
-            guard !inFlightRefreshes.contains(pid) else { return }
-            inFlightRefreshes.insert(pid)
+        let registration = refreshCoordinator.register(key: pid, payload: callbacks)
+        if let generation = registration.generationToStart {
             workQueue.async {
-                performWindowRefresh(for: app, pid: pid)
+                performWindowRefresh(for: app, pid: pid, generation: generation)
             }
         }
+        return registration.request
     }
 
-    private static func performWindowRefresh(for app: NSRunningApplication, pid: pid_t) {
-        let previews = makePreviews(for: app)
+    private static func performWindowRefresh(
+        for app: NSRunningApplication,
+        pid: pid_t,
+        generation: WindowRefreshGeneration<pid_t>
+    ) {
+        guard refreshCoordinator.begin(generation) else { return }
+        let shouldContinue = { refreshCoordinator.shouldContinue(generation) }
+        guard let refresh = makePreviews(for: app, shouldContinue: shouldContinue),
+              shouldContinue() else {
+            _ = refreshCoordinator.complete(generation)
+            return
+        }
+        let callbacks = refreshCoordinator.complete(generation)
+        guard !callbacks.isEmpty else { return }
         guard !app.isTerminated else {
-            let callbacks = refreshCallbacksByPID.removeValue(forKey: pid) ?? []
-            inFlightRefreshes.remove(pid)
+            remoteWindowElementResolver.removeAll(for: pid)
             purgeCachedApplication(pid: pid)
             DispatchQueue.main.async {
                 callbacks.forEach { $0.metadata([]) }
             }
             return
         }
+        let previews = refresh.previews
+        remoteWindowElementResolver.commit(refresh.remoteResolution)
         pruneThumbnailCache(for: pid, keeping: previews.map(\.windowID))
 
         previewsByPID[pid] = previews
         publishCachedPreviews(previews, for: pid, metadataRefreshed: true)
         pruneApplicationCachesIfNeeded(keeping: pid)
-        let callbacks = refreshCallbacksByPID.removeValue(forKey: pid) ?? []
         let thumbnailPolicy = callbacks
             .map(\.thumbnailPolicy)
             .max(by: { $0.rawValue < $1.rawValue }) ?? .none
-        let candidates = thumbnailCaptureCandidates(from: previews, policy: thumbnailPolicy)
-        inFlightRefreshes.remove(pid)
+        let candidates = thumbnailRefreshPlan(from: previews, policy: thumbnailPolicy).candidates
 
         DispatchQueue.main.async {
-            let deliverablePreviews = PermissionManager.status.screenRecordingGranted ?
+            guard !app.isTerminated else {
+                callbacks.forEach { $0.metadata([]) }
+                return
+            }
+            let deliverablePreviews = refresh.screenRecordingGranted ?
                 previews : previews.map { $0.replacingImage(with: nil) }
             callbacks.forEach { $0.metadata(deliverablePreviews) }
-            startThumbnailCaptures(candidates) { windowID, image in
+            startThumbnailCaptures(candidates) { windowID, result in
+                guard let image = result.image else { return }
                 callbacks.forEach { $0.thumbnail(windowID, image) }
             }
         }
     }
 
-    static func warmPreviewCache(for app: NSRunningApplication) {
-        refreshWindows(for: app, thumbnailPolicy: .missingOnly, metadata: { _ in }, thumbnail: { _, _ in })
+    @discardableResult
+    static func warmPreviewCache(
+        for app: NSRunningApplication,
+        metadata: @escaping ([WindowPreview]) -> Void = { _ in }
+    ) -> WindowRefreshRequest {
+        refreshWindows(for: app, thumbnailPolicy: .none, metadata: metadata, thumbnail: { _, _ in })
     }
 
-    private static func makePreviews(for app: NSRunningApplication) -> [WindowPreview] {
+    private static func makePreviews(
+        for app: NSRunningApplication,
+        shouldContinue: () -> Bool
+    ) -> WindowPreviewRefreshResult? {
         let pid = app.processIdentifier
-        let records = axWindows(for: app)
+        guard let windowResult = axWindows(for: app, shouldContinue: shouldContinue),
+              shouldContinue() else {
+            return nil
+        }
+        let records = windowResult.records
         let descriptions = windowDescriptions(records.map(\.windowID))
+        guard shouldContinue() else { return nil }
         let spaceSnapshot = WindowSpaceSnapshot.current()
         let focusedWindowID = focusedWindowID(for: pid)
-        return records
+        guard shouldContinue() else { return nil }
+        let screenRecordingGranted = PermissionManager.status.screenRecordingGranted
+        guard shouldContinue() else { return nil }
+        let previews = records
             .filter { record in
                 guard let description = descriptions[record.windowID] else { return true }
                 return description.ownerPID == pid
@@ -254,9 +290,16 @@ enum WindowInventory {
                     pid: pid,
                     description: descriptions[$0.windowID],
                     spaceSnapshot: spaceSnapshot,
-                    focusedWindowID: focusedWindowID
+                    focusedWindowID: focusedWindowID,
+                    screenRecordingGranted: screenRecordingGranted
                 )
             }
+        guard shouldContinue() else { return nil }
+        return WindowPreviewRefreshResult(
+            previews: previews,
+            remoteResolution: windowResult.remoteResolution,
+            screenRecordingGranted: screenRecordingGranted
+        )
     }
 
     private static func preview(
@@ -265,7 +308,8 @@ enum WindowInventory {
         pid: pid_t,
         description: WindowDescription?,
         spaceSnapshot: WindowSpaceSnapshot,
-        focusedWindowID: CGWindowID?
+        focusedWindowID: CGWindowID?,
+        screenRecordingGranted: Bool
     ) -> WindowPreview {
         let key = WindowCacheKey(pid: pid, windowID: record.windowID)
         let size = description?.bounds?.size ?? record.size ?? .zero
@@ -283,7 +327,7 @@ enum WindowInventory {
             isFullscreen: record.isFullscreen,
             isFocused: record.windowID == focusedWindowID,
             desktop: spaceSnapshot.desktop(for: record.windowID),
-            image: PermissionManager.status.screenRecordingGranted ? cachedImage : nil,
+            image: screenRecordingGranted ? cachedImage : nil,
             app: app
         )
     }
@@ -297,22 +341,51 @@ enum WindowInventory {
 
     static func refreshThumbnails(
         for app: NSRunningApplication,
-        limit: Int = 2,
-        thumbnail: @escaping (CGWindowID, NSImage) -> Void
+        maximumStaleCount: Int = 2,
+        completion: @escaping (CGWindowID, FreshThumbnailCaptureResult) -> Void
     ) {
         let pid = app.processIdentifier
         workQueue.async {
-            let candidates = Array(
-                thumbnailCaptureCandidates(
-                    from: previewsByPID[pid] ?? [],
-                    policy: .refreshStale
-                )
-                    .sorted(by: oldestCaptureFirst)
-                    .prefix(max(0, limit))
+            guard backgroundThumbnailTargetPID == pid else { return }
+            let previews = previewsByPID[pid] ?? []
+            guard PermissionManager.status.screenRecordingGranted else {
+                DispatchQueue.main.async {
+                    previews.forEach { completion($0.windowID, .unavailable) }
+                }
+                return
+            }
+            let refreshPlan = thumbnailRefreshPlan(
+                from: previews,
+                policy: .refreshStale
+            )
+            let orderedCandidates = refreshPlan.candidates
+                .sorted(by: oldestCaptureFirst)
+            let candidates = WindowThumbnailCapturePlan.select(
+                from: orderedCandidates,
+                maximumStaleCount: maximumStaleCount,
+                isMissing: { $0.mode.isMissing }
             )
             DispatchQueue.main.async {
-                startThumbnailCaptures(candidates, thumbnail: thumbnail)
+                refreshPlan.unavailableWindowIDs.forEach { completion($0, .unavailable) }
+                startThumbnailCaptures(
+                    candidates,
+                    requiredBackgroundTargetPID: pid,
+                    completion: completion
+                )
             }
+        }
+    }
+
+    static func setBackgroundThumbnailTarget(pid: pid_t?) {
+        workQueue.async {
+            backgroundThumbnailTargetPID = pid
+            cancelBackgroundThumbnailCaptures(except: pid)
+        }
+    }
+
+    static func resetThumbnailFailuresForSpaceChange() {
+        workQueue.async {
+            thumbnailFailureBackoff.removeAll()
         }
     }
 
@@ -716,9 +789,11 @@ enum WindowInventory {
     ) {
         let pid = app.processIdentifier
         let key = WindowCacheKey(pid: pid, windowID: windowID)
+        remoteWindowElementResolver.remove(pid: pid, windowID: windowID)
         workQueue.async {
             previewsByPID[pid]?.removeAll { $0.windowID == windowID }
             thumbnailsByWindow.removeValue(forKey: key)
+            thumbnailFailureBackoff.recordSuccess(for: key)
             invalidateCapture(for: key)
             publishCachedPreviews(previewsByPID[pid] ?? [], for: pid, metadataRefreshed: true)
             DispatchQueue.main.async(execute: completion)
@@ -738,6 +813,9 @@ enum WindowInventory {
         for key in removedKeys {
             thumbnailsByWindow.removeValue(forKey: key)
             invalidateCapture(for: key)
+        }
+        thumbnailFailureBackoff.removeAll { key in
+            key.pid == pid && !validKeys.contains(key)
         }
     }
 
@@ -761,36 +839,63 @@ enum WindowInventory {
         }
     }
 
-    private static func thumbnailCaptureCandidates(
+    private static func thumbnailRefreshPlan(
         from previews: [WindowPreview],
         policy: WindowThumbnailRefreshPolicy
-    ) -> [ThumbnailCaptureCandidate] {
-        guard PermissionManager.status.screenRecordingGranted else { return [] }
-        return previews.compactMap { preview in
+    ) -> ThumbnailRefreshPlan {
+        guard PermissionManager.status.screenRecordingGranted else { return .empty }
+        let now = ProcessInfo.processInfo.systemUptime
+        let captureDate = Date()
+        var candidates = [ThumbnailCaptureCandidate]()
+        var unavailableWindowIDs = [CGWindowID]()
+        for preview in previews {
             let key = WindowCacheKey(pid: preview.app.processIdentifier, windowID: preview.windowID)
             let geometry = WindowCaptureGeometry(preview.bounds)
+            let signature = WindowCaptureSignature(
+                geometry: geometry,
+                isMinimized: preview.isMinimized
+            )
             let entry = thumbnailsByWindow[key].flatMap {
                 $0.geometry == geometry ? $0 : nil
             }
-            switch policy {
+            let isBackingOff = !thumbnailFailureBackoff.allowsAttempt(
+                for: key,
+                signature: signature,
+                now: now
+            )
+            let isInFlight = inFlightCaptures.contains {
+                isCurrentCaptureRequest($0, for: key, signature: signature)
+            }
+            let isStale = entry.map {
+                captureDate.timeIntervalSince($0.capturedAt) >= thumbnailLiveRefreshMinimumAge
+            } ?? false
+            let decision = WindowThumbnailAttemptPolicy.decide(
+                hasCachedImage: entry != nil,
+                isMinimized: preview.isMinimized,
+                isStale: isStale,
+                isInFlight: isInFlight,
+                isBackingOff: isBackingOff,
+                allowsMissingCapture: policy != .none,
+                allowsStaleCapture: policy == .refreshStale
+            )
+            switch decision {
             case .none:
-                return nil
-            case .missingOnly:
-                guard entry == nil else { return nil }
-                return ThumbnailCaptureCandidate(preview: preview, mode: .missingOnly)
-            case .refreshStale:
-                guard let entry else {
-                    return ThumbnailCaptureCandidate(preview: preview, mode: .missingOnly)
-                }
-                guard Date().timeIntervalSince(entry.capturedAt) >= thumbnailLiveRefreshMinimumAge else {
-                    return nil
-                }
-                return ThumbnailCaptureCandidate(
+                break
+            case .captureMissing:
+                candidates.append(ThumbnailCaptureCandidate(preview: preview, mode: .missingOnly))
+            case .captureStale:
+                candidates.append(ThumbnailCaptureCandidate(
                     preview: preview,
                     mode: .staleAfter(thumbnailLiveRefreshMinimumAge)
-                )
+                ))
+            case .unavailableBackoff:
+                unavailableWindowIDs.append(preview.windowID)
             }
         }
+        return ThumbnailRefreshPlan(
+            candidates: candidates,
+            unavailableWindowIDs: unavailableWindowIDs
+        )
     }
 
     private static func oldestCaptureFirst(
@@ -826,14 +931,21 @@ enum WindowInventory {
 
     private static func startThumbnailCaptures(
         _ candidates: [ThumbnailCaptureCandidate],
-        thumbnail: @escaping (CGWindowID, NSImage) -> Void
+        requiredBackgroundTargetPID: pid_t? = nil,
+        completion: @escaping (CGWindowID, FreshThumbnailCaptureResult) -> Void
     ) {
         for candidate in candidates {
-            captureThumbnail(for: candidate.preview, mode: candidate.mode) { result in
-                guard let image = result.image else { return }
+            captureThumbnail(
+                for: candidate.preview,
+                mode: candidate.mode,
+                requiredBackgroundTargetPID: requiredBackgroundTargetPID
+            ) { result in
                 DispatchQueue.main.async {
-                    guard PermissionManager.status.screenRecordingGranted else { return }
-                    thumbnail(candidate.preview.windowID, image)
+                    if result.image != nil,
+                       !PermissionManager.status.screenRecordingGranted {
+                        return
+                    }
+                    completion(candidate.preview.windowID, result)
                 }
             }
         }
@@ -878,7 +990,7 @@ enum WindowInventory {
         let purgeablePIDs = previewsByPID.keys
             .filter { pid in
                 (activePID == nil || pid != activePID) &&
-                    !inFlightRefreshes.contains(pid) &&
+                    !refreshCoordinator.isInFlight(for: pid) &&
                     !inFlightCaptures.contains(where: { $0.cacheKey.pid == pid })
             }
             .sorted {
@@ -897,6 +1009,7 @@ enum WindowInventory {
             thumbnailsByWindow.removeValue(forKey: $0)
             invalidateCapture(for: $0)
         }
+        thumbnailFailureBackoff.removeAll { $0.pid == pid }
         previewsByPID.removeValue(forKey: pid)
         cachedPreviewsLock.lock()
         cachedPreviewsSnapshotByPID.removeValue(forKey: pid)
@@ -908,11 +1021,21 @@ enum WindowInventory {
     private static func captureThumbnail(
         for preview: WindowPreview,
         mode: ThumbnailCaptureMode = .missingOnly,
+        requiredBackgroundTargetPID: pid_t? = nil,
         completion: @escaping (FreshThumbnailCaptureResult) -> Void
     ) {
         let key = WindowCacheKey(pid: preview.app.processIdentifier, windowID: preview.windowID)
         let geometry = WindowCaptureGeometry(preview.bounds)
+        let signature = WindowCaptureSignature(
+            geometry: geometry,
+            isMinimized: preview.isMinimized
+        )
         workQueue.async {
+            if let requiredBackgroundTargetPID,
+               backgroundThumbnailTargetPID != requiredBackgroundTargetPID {
+                completion(.unavailable)
+                return
+            }
             guard PermissionManager.status.screenRecordingGranted else {
                 completion(.unavailable)
                 return
@@ -922,14 +1045,14 @@ enum WindowInventory {
                 completion(.cached(cachedImage))
                 return
             }
-            if let request = queuedCaptureRequest(for: key, geometry: geometry, priority: priority) {
+            if let request = queuedCaptureRequest(for: key, signature: signature, priority: priority) {
                 captureCompletionsByWindow[request, default: []].append(completion)
                 return
             }
             nextCaptureSequence &+= 1
             let request = WindowCaptureRequestKey(
                 cacheKey: key,
-                geometry: geometry,
+                signature: signature,
                 priority: priority,
                 sequence: nextCaptureSequence,
                 invalidationGeneration: captureInvalidationGenerationByWindow[key, default: 0]
@@ -945,8 +1068,13 @@ enum WindowInventory {
         _ request: WindowCaptureRequestKey,
         preview: WindowPreview
     ) {
-        queue(for: request.priority).addOperation {
-            capture(windowID: preview.windowID) { image in
+        let operation = BlockOperation()
+        operation.addExecutionBlock { [weak operation] in
+            guard operation?.isCancelled == false else { return }
+            capture(
+                windowID: preview.windowID,
+                resolution: request.priority.captureResolution
+            ) { image in
                 let capturedImage = image?.hasUsableWindowAlpha == true ? image : nil
                 let cachedImage = capturedImage?.downscaled(
                     maximumPixelDimension: maximumCachedThumbnailPixelDimension
@@ -961,6 +1089,8 @@ enum WindowInventory {
                 }
             }
         }
+        captureOperationsByRequest[request] = operation
+        queue(for: request.priority).addOperation(operation)
     }
 
     private static func finishThumbnailCapture(
@@ -969,13 +1099,18 @@ enum WindowInventory {
         deliveredImage: NSImage?
     ) {
         let key = request.cacheKey
-        let currentGeometry = previewsByPID[key.pid]?
+        let currentSignature = previewsByPID[key.pid]?
             .first(where: { $0.windowID == key.windowID })
-            .map { WindowCaptureGeometry($0.bounds) }
+            .map {
+                WindowCaptureSignature(
+                    geometry: WindowCaptureGeometry($0.bounds),
+                    isMinimized: $0.isMinimized
+                )
+            }
         let isLatestRequest = request.sequence == latestCaptureSequenceByWindow[key]
         let isValidRequest = request.invalidationGeneration ==
             captureInvalidationGenerationByWindow[key, default: 0] &&
-            currentGeometry == request.geometry &&
+            currentSignature == request.signature &&
             PermissionManager.status.screenRecordingGranted &&
             isLatestRequest
         let result: FreshThumbnailCaptureResult
@@ -985,6 +1120,17 @@ enum WindowInventory {
         let shouldStoreCapturedImage = existingEntry.map {
             $0.sequence < request.sequence
         } ?? true
+        if isValidRequest {
+            if cachedImage == nil, request.priority == .background {
+                thumbnailFailureBackoff.recordFailure(
+                    for: key,
+                    signature: request.signature,
+                    now: ProcessInfo.processInfo.systemUptime
+                )
+            } else if cachedImage != nil {
+                thumbnailFailureBackoff.recordSuccess(for: key)
+            }
+        }
         if isValidRequest,
            let cachedImage,
            let deliveredImage,
@@ -1003,35 +1149,51 @@ enum WindowInventory {
             result = .unavailable
         }
         inFlightCaptures.remove(request)
+        captureOperationsByRequest.removeValue(forKey: request)
         let completions = captureCompletionsByWindow.removeValue(forKey: request) ?? []
         cleanupCaptureState(for: request)
         pruneApplicationCachesIfNeeded(keeping: nil)
         completions.forEach { $0(result) }
     }
 
+    private static func cancelBackgroundThumbnailCaptures(except retainedPID: pid_t?) {
+        let requests = inFlightCaptures.filter { request in
+            request.priority == .background && request.cacheKey.pid != retainedPID
+        }
+        requests.forEach(cancelThumbnailCapture)
+    }
+
+    private static func cancelThumbnailCapture(_ request: WindowCaptureRequestKey) {
+        captureOperationsByRequest.removeValue(forKey: request)?.cancel()
+        inFlightCaptures.remove(request)
+        let completions = captureCompletionsByWindow.removeValue(forKey: request) ?? []
+        cleanupCaptureState(for: request)
+        completions.forEach { $0(.unavailable) }
+    }
+
     private static func queuedCaptureRequest(
         for key: WindowCacheKey,
-        geometry: WindowCaptureGeometry,
+        signature: WindowCaptureSignature,
         priority: ThumbnailCapturePriority
     ) -> WindowCaptureRequestKey? {
         if let liveRequest = inFlightCaptures.first(where: {
-            isCurrentCaptureRequest($0, for: key, geometry: geometry) && $0.priority == .live
+            isCurrentCaptureRequest($0, for: key, signature: signature) && $0.priority == .live
         }) {
             return liveRequest
         }
         guard priority == .background else { return nil }
         return inFlightCaptures.first {
-            isCurrentCaptureRequest($0, for: key, geometry: geometry) && $0.priority == .background
+            isCurrentCaptureRequest($0, for: key, signature: signature) && $0.priority == .background
         }
     }
 
     private static func isCurrentCaptureRequest(
         _ request: WindowCaptureRequestKey,
         for key: WindowCacheKey,
-        geometry: WindowCaptureGeometry
+        signature: WindowCaptureSignature
     ) -> Bool {
         request.cacheKey == key &&
-            request.geometry == geometry &&
+            request.signature == signature &&
             request.invalidationGeneration == captureInvalidationGenerationByWindow[key, default: 0] &&
             request.sequence == latestCaptureSequenceByWindow[key]
     }
@@ -1065,20 +1227,42 @@ enum WindowInventory {
         }
     }
 
-    private static func capture(windowID: CGWindowID, completion: @escaping (NSImage?) -> Void) {
-        completion(captureWithSkyLight(windowID: windowID))
+    private static func capture(
+        windowID: CGWindowID,
+        resolution: SkyLightWindowCaptureResolution,
+        completion: @escaping (NSImage?) -> Void
+    ) {
+        completion(captureWithSkyLight(windowID: windowID, resolution: resolution))
     }
 
-    private static func captureWithSkyLight(windowID: CGWindowID) -> NSImage? {
-        guard let cgImage = SkyLightCapture.capture(windowID: windowID) else { return nil }
+    private static func captureWithSkyLight(
+        windowID: CGWindowID,
+        resolution: SkyLightWindowCaptureResolution
+    ) -> NSImage? {
+        guard let cgImage = SkyLightCapture.capture(
+            windowID: windowID,
+            resolution: resolution
+        ) else {
+            return nil
+        }
         return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
     }
 
-    private static func axWindows(for app: NSRunningApplication) -> [WindowRecord] {
-        let windows = axWindowElements(for: app.processIdentifier)
+    private static func axWindows(
+        for app: NSRunningApplication,
+        shouldContinue: () -> Bool
+    ) -> AXWindowRecordResult? {
+        guard let windowResult = axWindowElements(
+            for: app.processIdentifier,
+            shouldContinue: shouldContinue
+        ) else {
+            return nil
+        }
+        let windows = windowResult.elements
         var records = [WindowRecord]()
 
         for window in windows {
+            guard shouldContinue() else { return nil }
             guard let id = windowID(for: window) else { continue }
             let title = AccessibilityHelpers.stringAttribute(window, kAXTitleAttribute as CFString)?
                 .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1098,7 +1282,10 @@ enum WindowInventory {
             ))
         }
 
-        return unique(records)
+        return AXWindowRecordResult(
+            records: unique(records),
+            remoteResolution: windowResult.remoteResolution
+        )
     }
 
     private static func validWindowSize(_ size: CGSize?) -> CGSize? {
@@ -1112,9 +1299,18 @@ enum WindowInventory {
         if let match = windows.first(where: { self.windowID(for: $0) == windowID }) {
             return match
         }
-        let knownWindowIDs = Set(windows.compactMap { self.windowID(for: $0) })
-        return windowsByBruteForce(pid: app.processIdentifier, knownWindowIDs: knownWindowIDs)
-            .first { self.windowID(for: $0) == windowID }
+        let knownWindowElements = windows.reduce(into: [CGWindowID: AXUIElement]()) { result, element in
+            guard let windowID = self.windowID(for: element) else { return }
+            result[windowID] = element
+        }
+        guard let resolution = remoteWindowResolution(
+            pid: app.processIdentifier,
+            knownWindowElements: knownWindowElements
+        ) else {
+            return nil
+        }
+        remoteWindowElementResolver.commit(resolution)
+        return resolution.windows.first { self.windowID(for: $0) == windowID }
     }
 
     private static func axElementAttribute(_ element: AXUIElement, _ attribute: CFString) -> AXUIElement? {
@@ -1124,47 +1320,76 @@ enum WindowInventory {
         return (value as! AXUIElement)
     }
 
-    private static func axWindowElements(for pid: pid_t) -> [AXUIElement] {
+    private static func axWindowElements(
+        for pid: pid_t,
+        shouldContinue: () -> Bool
+    ) -> AXWindowElementResult? {
+        guard shouldContinue() else { return nil }
         let appElement = AXUIElementCreateApplication(pid)
         let axWindows = AccessibilityHelpers.elementArrayAttribute(appElement, kAXWindowsAttribute as CFString)
-        let knownWindowIDs = Set(axWindows.compactMap(windowID))
-        return axWindows + windowsByBruteForce(pid: pid, knownWindowIDs: knownWindowIDs)
+        guard shouldContinue() else { return nil }
+        let knownWindowElements = axWindows.reduce(into: [CGWindowID: AXUIElement]()) { result, element in
+            guard let windowID = windowID(for: element) else { return }
+            result[windowID] = element
+        }
+        guard let remoteResolution = remoteWindowResolution(
+            pid: pid,
+            knownWindowElements: knownWindowElements,
+            shouldContinue: shouldContinue
+        ) else {
+            return nil
+        }
+        return AXWindowElementResult(
+            elements: axWindows + remoteResolution.windows,
+            remoteResolution: remoteResolution
+        )
     }
 
-    private static func windowsByBruteForce(pid: pid_t, knownWindowIDs: Set<CGWindowID>) -> [AXUIElement] {
-        let targetWindowIDs = bruteForceTargetWindowIDs(pid: pid)
-        var missingWindowIDs = targetWindowIDs.subtracting(knownWindowIDs)
-        if !targetWindowIDs.isEmpty && missingWindowIDs.isEmpty { return [] }
-        var remoteToken = Data(count: 20)
-        remoteToken.replaceSubrange(0..<4, with: withUnsafeBytes(of: pid) { Data($0) })
-        remoteToken.replaceSubrange(4..<8, with: withUnsafeBytes(of: Int32(0)) { Data($0) })
-        remoteToken.replaceSubrange(8..<12, with: withUnsafeBytes(of: Int32(0x636f636f)) { Data($0) })
+    private static func remoteWindowResolution(
+        pid: pid_t,
+        knownWindowElements: [CGWindowID: AXUIElement],
+        shouldContinue: () -> Bool = { true }
+    ) -> RemoteWindowElementResolution? {
+        guard shouldContinue() else { return nil }
+        guard let snapshot = bruteForceWindowSnapshot(
+            pid: pid,
+            shouldContinue: shouldContinue
+        ) else {
+            return nil
+        }
+        return remoteWindowElementResolver.resolve(
+            pid: pid,
+            knownWindowIDs: Set(knownWindowElements.keys),
+            knownWindowElements: knownWindowElements,
+            targetWindowIDs: snapshot.targetWindowIDs,
+            shouldContinue: shouldContinue
+        )
+    }
 
-        let scanLimit = remoteTokenScanLimit(targetWindowIDs: targetWindowIDs)
-        let deadline = Date().addingTimeInterval(targetWindowIDs.isEmpty ? 0.10 : 0.35)
-        var windows = [AXUIElement]()
-        for axElementID in UInt64(0)..<scanLimit {
-            guard Date() < deadline else { break }
-            remoteToken.replaceSubrange(12..<20, with: withUnsafeBytes(of: axElementID) { Data($0) })
-            guard let element = _AXUIElementCreateWithRemoteToken(remoteToken as CFData)?.takeRetainedValue() else {
+    private static func bruteForceWindowSnapshot(
+        pid: pid_t,
+        shouldContinue: () -> Bool
+    ) -> BruteForceWindowSnapshot? {
+        guard shouldContinue() else { return nil }
+        guard let windows = CGWindowListCopyWindowInfo(
+            [.optionAll, .excludeDesktopElements],
+            kCGNullWindowID
+        ) as? [[String: Any]] else {
+            return BruteForceWindowSnapshot(targetWindowIDs: nil)
+        }
+        var targetWindowIDs = Set<CGWindowID>()
+        for description in windows {
+            guard shouldContinue() else { return nil }
+            guard description[kCGWindowOwnerPID as String] as? pid_t == pid,
+                  let windowID = description[kCGWindowNumber as String] as? CGWindowID else {
                 continue
             }
-            guard isAXWindowElement(element) else { continue }
-            windows.append(element)
-            if let windowID = windowID(for: element) {
-                missingWindowIDs.remove(windowID)
+            if isBruteForceTargetWindow(description, pid: pid),
+               isAssignedToUserSpaceOrUnknown(windowID: windowID) {
+                targetWindowIDs.insert(windowID)
             }
-            if !targetWindowIDs.isEmpty && missingWindowIDs.isEmpty { break }
         }
-        return windows
-    }
-
-    private static func bruteForceTargetWindowIDs(pid: pid_t) -> Set<CGWindowID> {
-        let windows = CGWindowListCopyWindowInfo([.optionAll, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] ?? []
-        return Set(windows.compactMap { description in
-            guard isBruteForceTargetWindow(description, pid: pid) else { return nil }
-            return description[kCGWindowNumber as String] as? CGWindowID
-        })
+        return BruteForceWindowSnapshot(targetWindowIDs: Optional(targetWindowIDs))
     }
 
     private static func isBruteForceTargetWindow(_ description: [String: Any], pid: pid_t) -> Bool {
@@ -1178,19 +1403,10 @@ enum WindowInventory {
         return bounds.width >= 80 && bounds.height >= 60
     }
 
-    private static func remoteTokenScanLimit(targetWindowIDs: Set<CGWindowID>) -> UInt64 {
-        guard let maxWindowID = targetWindowIDs.max() else { return remoteTokenFallbackScanLimit }
-        let paddedLimit = UInt64(maxWindowID) + remoteTokenScanPadding
-        return min(max(remoteTokenFallbackScanLimit, paddedLimit), remoteTokenMaximumScanLimit)
-    }
-
-    private static func isAXWindowElement(_ element: AXUIElement) -> Bool {
-        let subrole = AccessibilityHelpers.stringAttribute(element, kAXSubroleAttribute as CFString)
-        return [
-            kAXStandardWindowSubrole as String,
-            kAXDialogSubrole as String,
-            kAXFloatingWindowSubrole as String
-        ].contains(subrole ?? "")
+    private static func isAssignedToUserSpaceOrUnknown(windowID: CGWindowID) -> Bool {
+        WindowSpaceMembership.isRemoteRecoveryCandidate(
+            spaceIDs: SkyLightCapture.spaceIDsIfAvailable(windowID: windowID)
+        )
     }
 
     private static func windowID(for element: AXUIElement) -> CGWindowID? {
@@ -1303,10 +1519,14 @@ private struct WindowCacheKey: Hashable {
 
 private struct WindowCaptureRequestKey: Hashable {
     let cacheKey: WindowCacheKey
-    let geometry: WindowCaptureGeometry
+    let signature: WindowCaptureSignature
     let priority: ThumbnailCapturePriority
     let sequence: UInt64
     let invalidationGeneration: UInt64
+
+    var geometry: WindowCaptureGeometry {
+        signature.geometry
+    }
 }
 
 private struct ThumbnailCacheEntry {
@@ -1317,22 +1537,32 @@ private struct ThumbnailCacheEntry {
 }
 
 private struct WindowCaptureGeometry: Hashable {
-    let minX: UInt64
-    let minY: UInt64
     let width: UInt64
     let height: UInt64
 
     init(_ bounds: CGRect) {
-        minX = Double(bounds.minX).bitPattern
-        minY = Double(bounds.minY).bitPattern
         width = Double(bounds.width).bitPattern
         height = Double(bounds.height).bitPattern
     }
 }
 
+private struct WindowCaptureSignature: Hashable {
+    let geometry: WindowCaptureGeometry
+    let isMinimized: Bool
+}
+
 private enum ThumbnailCapturePriority: Hashable {
     case background
     case live
+
+    var captureResolution: SkyLightWindowCaptureResolution {
+        switch self {
+        case .background:
+            return .nominal
+        case .live:
+            return .best
+        }
+    }
 }
 
 private enum ThumbnailCaptureMode {
@@ -1344,11 +1574,23 @@ private enum ThumbnailCaptureMode {
         if case .fresh = self { return .live }
         return .background
     }
+
+    var isMissing: Bool {
+        if case .missingOnly = self { return true }
+        return false
+    }
 }
 
 private struct ThumbnailCaptureCandidate {
     let preview: WindowPreview
     let mode: ThumbnailCaptureMode
+}
+
+private struct ThumbnailRefreshPlan {
+    let candidates: [ThumbnailCaptureCandidate]
+    let unavailableWindowIDs: [CGWindowID]
+
+    static let empty = ThumbnailRefreshPlan(candidates: [], unavailableWindowIDs: [])
 }
 
 private struct WindowRefreshCallbacks {
@@ -1361,6 +1603,26 @@ private struct WindowDescription {
     let ownerPID: pid_t
     let bounds: CGRect?
     let level: CGWindowLevel?
+}
+
+private struct BruteForceWindowSnapshot {
+    let targetWindowIDs: Set<CGWindowID>?
+}
+
+private struct AXWindowElementResult {
+    let elements: [AXUIElement]
+    let remoteResolution: RemoteWindowElementResolution
+}
+
+private struct AXWindowRecordResult {
+    let records: [WindowRecord]
+    let remoteResolution: RemoteWindowElementResolution
+}
+
+private struct WindowPreviewRefreshResult {
+    let previews: [WindowPreview]
+    let remoteResolution: RemoteWindowElementResolution
+    let screenRecordingGranted: Bool
 }
 
 private enum WindowPresence: Equatable {
