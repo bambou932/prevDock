@@ -8,13 +8,14 @@ final class DockGeometryCache {
     private var cachedInteractionRects = [CGRect]()
     private var cachedEdgeEntryRects = [CGRect]()
     private var cachedNativeLabelSuppressionRects = [CGRect]()
+    private var cachedPreviewAnchor: CGRect?
     private var recentlyResolvedDockItemRect: CGRect?
-    private var recentlyResolvedDockItemAt = Date.distantPast
+    private var recentlyResolvedDockItemAt = -TimeInterval.infinity
     private var provisionalInteractionRects = [CGRect]()
-    private var provisionalInteractionExpiresAt = Date.distantPast
-    private var lastFallbackProbeAt = Date.distantPast
+    private var provisionalInteractionExpiresAt = -TimeInterval.infinity
+    private var lastFallbackProbeAt = -TimeInterval.infinity
     private var cachedDockPID: pid_t?
-    private var lastRefresh = Date.distantPast
+    private var lastRefresh = -TimeInterval.infinity
     private var hasReliableGeometry = false
     private var screenObserver: NSObjectProtocol?
     private var dockObservers = [NSObjectProtocol]()
@@ -54,21 +55,31 @@ final class DockGeometryCache {
         }
 
         let dockElement = AXUIElementCreateApplication(dock.processIdentifier)
-        let dockRects = dockLists(in: dockElement).compactMap(dockRect)
-        let dockItemRects = dockItems(in: dockElement).compactMap(dockRect)
+        let deadline = ProcessInfo.processInfo.systemUptime + DockAccessibility.maximumScanDuration
+        var dockRects = [CGRect]()
+        var dockItemRects = [CGRect]()
+        collectDockGeometry(in: dockElement, deadline: deadline, lists: &dockRects, items: &dockItemRects)
         let labelSuppressionSourceRects = dockItemRects.isEmpty ? dockRects : dockItemRects
         cachedInteractionRects = dockRects.compactMap(interactionRect)
         cachedEdgeEntryRects = dockRects.compactMap(edgeEntryRect)
         cachedNativeLabelSuppressionRects = labelSuppressionSourceRects.compactMap(nativeLabelSuppressionRect)
+        cachedPreviewAnchor = dockRects.compactMap(nativeLabelSuppressionRect).max {
+            $0.width * $0.height < $1.width * $1.height
+        }
         cachedDockPID = dock.processIdentifier
-        hasReliableGeometry = !cachedInteractionRects.isEmpty
-        lastRefresh = Date()
+        hasReliableGeometry = !cachedInteractionRects.isEmpty && ProcessInfo.processInfo.systemUptime < deadline
+        lastRefresh = ProcessInfo.processInfo.systemUptime
     }
 
     func refreshIfStale() {
         let interval = hasReliableGeometry ? refreshInterval : failedRefreshInterval
-        guard Date().timeIntervalSince(lastRefresh) > interval else { return }
+        guard (ProcessInfo.processInfo.systemUptime - lastRefresh) > interval else { return }
         refreshNow()
+    }
+
+    func previewAnchor() -> CGRect? {
+        refreshIfStale()
+        return cachedPreviewAnchor
     }
 
     func isInDockInteractionStrip(_ point: CGPoint, refreshIfStale: Bool = true) -> Bool {
@@ -83,11 +94,11 @@ final class DockGeometryCache {
             return true
         }
         guard isInFallbackDockStrip(point) else { return false }
-        let now = Date()
-        guard now.timeIntervalSince(lastFallbackProbeAt) >= fallbackProbeInterval else { return false }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard (now - lastFallbackProbeAt) >= fallbackProbeInterval else { return false }
         lastFallbackProbeAt = now
         provisionalInteractionRects = makeProvisionalInteractionRects(at: point)
-        provisionalInteractionExpiresAt = now.addingTimeInterval(provisionalInteractionLifetime)
+        provisionalInteractionExpiresAt = (now + provisionalInteractionLifetime)
         return true
     }
 
@@ -109,25 +120,26 @@ final class DockGeometryCache {
             .intersection(screen.frame)
         guard !rect.isNull, !rect.isEmpty else { return }
         recentlyResolvedDockItemRect = rect
-        recentlyResolvedDockItemAt = Date()
+        recentlyResolvedDockItemAt = ProcessInfo.processInfo.systemUptime
     }
 
     private func clear() {
         cachedInteractionRects = []
         cachedEdgeEntryRects = []
         cachedNativeLabelSuppressionRects = []
+        cachedPreviewAnchor = nil
         recentlyResolvedDockItemRect = nil
-        recentlyResolvedDockItemAt = .distantPast
+        recentlyResolvedDockItemAt = -TimeInterval.infinity
         provisionalInteractionRects = []
-        provisionalInteractionExpiresAt = .distantPast
-        lastFallbackProbeAt = .distantPast
+        provisionalInteractionExpiresAt = -TimeInterval.infinity
+        lastFallbackProbeAt = -TimeInterval.infinity
         cachedDockPID = nil
         hasReliableGeometry = false
-        lastRefresh = Date()
+        lastRefresh = ProcessInfo.processInfo.systemUptime
     }
 
     private func containsRecentlyResolvedDockItem(_ point: CGPoint) -> Bool {
-        guard Date().timeIntervalSince(recentlyResolvedDockItemAt) <= resolvedDockItemLifetime else {
+        guard (ProcessInfo.processInfo.systemUptime - recentlyResolvedDockItemAt) <= resolvedDockItemLifetime else {
             recentlyResolvedDockItemRect = nil
             return false
         }
@@ -135,7 +147,7 @@ final class DockGeometryCache {
     }
 
     private func containsProvisionalInteraction(_ point: CGPoint) -> Bool {
-        guard Date() <= provisionalInteractionExpiresAt else {
+        guard ProcessInfo.processInfo.systemUptime <= provisionalInteractionExpiresAt else {
             provisionalInteractionRects = []
             return false
         }
@@ -180,6 +192,7 @@ final class DockGeometryCache {
             cachedInteractionRects = []
             cachedEdgeEntryRects = []
             cachedNativeLabelSuppressionRects = []
+            cachedPreviewAnchor = nil
             hasReliableGeometry = false
             DockHoverTargetResolver.invalidateDockCache()
         }
@@ -205,29 +218,37 @@ final class DockGeometryCache {
             return
         }
         clear()
-        lastRefresh = .distantPast
+        lastRefresh = -TimeInterval.infinity
         DockHoverTargetResolver.invalidateDockCache()
     }
 
-    private func dockLists(in element: AXUIElement, depth: Int = 0) -> [AXUIElement] {
-        guard depth < 5 else { return [] }
+    private func collectDockGeometry(
+        in element: AXUIElement,
+        depth: Int = 0,
+        deadline: TimeInterval,
+        lists: inout [CGRect],
+        items: inout [CGRect]
+    ) {
+        guard depth < 7, ProcessInfo.processInfo.systemUptime < deadline else { return }
+        DockAccessibility.prepare(element)
         let role = AccessibilityHelpers.stringAttribute(element, kAXRoleAttribute as CFString) ?? ""
+        if role == "AXList", depth < 5, let rect = dockRect(for: element) {
+            lists.append(rect)
+        }
+        if isDockItem(element, role: role), let rect = dockRect(for: element) {
+            items.append(rect)
+        }
+        guard ProcessInfo.processInfo.systemUptime < deadline else { return }
         let children = AccessibilityHelpers.elementArrayAttribute(element, kAXChildrenAttribute as CFString)
-        let childLists = children.flatMap { dockLists(in: $0, depth: depth + 1) }
-        return role == "AXList" ? [element] + childLists : childLists
+        for child in children {
+            collectDockGeometry(in: child, depth: depth + 1, deadline: deadline, lists: &lists, items: &items)
+        }
     }
 
-    private func dockItems(in element: AXUIElement, depth: Int = 0) -> [AXUIElement] {
-        guard depth < 7 else { return [] }
-        let children = AccessibilityHelpers.elementArrayAttribute(element, kAXChildrenAttribute as CFString)
-        let childItems = children.flatMap { dockItems(in: $0, depth: depth + 1) }
-        return isDockItem(element) ? [element] + childItems : childItems
-    }
-
-    private func isDockItem(_ element: AXUIElement) -> Bool {
-        let role = AccessibilityHelpers.stringAttribute(element, kAXRoleAttribute as CFString) ?? ""
+    private func isDockItem(_ element: AXUIElement, role: String) -> Bool {
+        if role == "AXDockItem" { return true }
         let subrole = AccessibilityHelpers.stringAttribute(element, kAXSubroleAttribute as CFString) ?? ""
-        return role == "AXDockItem" || subrole.localizedCaseInsensitiveContains("DockItem")
+        return subrole.localizedCaseInsensitiveContains("DockItem")
     }
 
     private func dockRect(for element: AXUIElement) -> CGRect? {

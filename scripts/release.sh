@@ -2,6 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT_DIR/scripts/swift-toolchain.sh"
 INFO_PLIST="$ROOT_DIR/Resources/Info.plist"
 APPCAST="$ROOT_DIR/appcast.xml"
 GH_REPO="${PREVDOCK_GITHUB_REPO:-bambou932/prevDock}"
@@ -35,6 +36,26 @@ set_plist_value() {
 ensure_clean_tree() {
   if [[ -n "$(git -C "$ROOT_DIR" status --porcelain)" ]]; then
     echo "Release requires a clean git tree." >&2
+    exit 1
+  fi
+}
+
+ensure_release_state() {
+  local version="$1"
+  if [[ "$(git -C "$ROOT_DIR" symbolic-ref --quiet --short HEAD || true)" != "main" ]]; then
+    echo "Release requires main after its pull requests have been merged." >&2
+    exit 1
+  fi
+  if git -C "$ROOT_DIR" show-ref --verify --quiet "refs/tags/v$version"; then
+    echo "Release tag v$version already exists." >&2
+    exit 1
+  fi
+  if [[ "$SWIFT_TARGET_ARCH" != "arm64" ]]; then
+    echo "Published release archives currently require an arm64 build." >&2
+    exit 1
+  fi
+  if [[ "$DEPLOYMENT_TARGET" != "$(plist_value :LSMinimumSystemVersion)" ]]; then
+    echo "Published releases must use the minimum macOS version declared in Info.plist." >&2
     exit 1
   fi
 }
@@ -155,7 +176,7 @@ write_appcast() {
     <item>
       <title>prevDock $version Preview</title>
       <pubDate>$pub_date</pubDate>
-      <sparkle:minimumSystemVersion>14.0</sparkle:minimumSystemVersion>
+      <sparkle:minimumSystemVersion>$DEPLOYMENT_TARGET</sparkle:minimumSystemVersion>
       <sparkle:releaseNotesLink>https://github.com/$GH_REPO/releases/tag/v$version</sparkle:releaseNotesLink>
       <enclosure
         url="https://github.com/$GH_REPO/releases/download/v$version/$(basename "$zip_path")"
@@ -196,23 +217,17 @@ publish_github_release() {
 }
 
 ensure_tap_repo() {
-  if [[ -d "$TAP_DIR/.git" ]]; then
-    git -C "$TAP_DIR" config user.name "bambou932"
-    git -C "$TAP_DIR" config user.email "bambou932@gmail.com"
+  if [[ -e "$TAP_DIR/.git" ]]; then
     return
   fi
 
   if gh repo view "$TAP_REPO" >/dev/null 2>&1; then
     gh repo clone "$TAP_REPO" "$TAP_DIR"
-    git -C "$TAP_DIR" config user.name "bambou932"
-    git -C "$TAP_DIR" config user.email "bambou932@gmail.com"
     return
   fi
 
   mkdir -p "$TAP_DIR"
   git -C "$TAP_DIR" init -b main
-  git -C "$TAP_DIR" config user.name "bambou932"
-  git -C "$TAP_DIR" config user.email "bambou932@gmail.com"
   gh repo create "$TAP_REPO" --public --source "$TAP_DIR" --remote origin
 }
 
@@ -221,16 +236,24 @@ write_cask() {
   local sha256="$2"
 
   ensure_tap_repo
+  if [[ -n "$(git -C "$TAP_DIR" status --porcelain)" ]]; then
+    echo "Homebrew tap requires a clean git tree." >&2
+    exit 1
+  fi
+  if [[ "$(git -C "$TAP_DIR" symbolic-ref --quiet --short HEAD || true)" != "main" ]]; then
+    echo "Homebrew tap publishing requires main." >&2
+    exit 1
+  fi
   mkdir -p "$TAP_DIR/Casks"
   cat >"$TAP_DIR/Casks/prevdock.rb" <<CASK
 cask "prevdock" do
   version "$version"
   sha256 "$sha256"
 
-  url "https://github.com/bambou932/prevDock/releases/download/v#{version}/prevDock-#{version}-arm64.zip"
+  url "https://github.com/$GH_REPO/releases/download/v#{version}/prevDock-#{version}-arm64.zip"
   name "prevDock"
   desc "Dock hover window previews for macOS"
-  homepage "https://github.com/bambou932/prevDock"
+  homepage "https://github.com/$GH_REPO"
 
   livecheck do
     url :url
@@ -248,7 +271,10 @@ cask "prevdock" do
   zap trash: [
     "~/Library/Preferences/io.github.bambou932.prevDock.plist",
   ]
+CASK
 
+  if ! should_notarize; then
+    cat >>"$TAP_DIR/Casks/prevdock.rb" <<'CASK'
   caveats <<~EOS
     prevDock preview builds are not Apple-notarized yet.
 
@@ -259,8 +285,9 @@ cask "prevdock" do
 
     You can also allow it from System Settings > Privacy & Security > Open Anyway.
   EOS
-end
 CASK
+  fi
+  echo "end" >>"$TAP_DIR/Casks/prevdock.rb"
 
   git -C "$TAP_DIR" add Casks/prevdock.rb
   if ! git -C "$TAP_DIR" diff --cached --quiet; then
@@ -272,10 +299,12 @@ CASK
 main() {
   local version="${1:-}"
   [[ -n "$version" ]] || usage
-  [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || usage
+  [[ "$#" -le 2 && "$version" =~ ^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]] || usage
+  [[ -z "${2:-}" || "$2" =~ ^[1-9][0-9]*$ ]] || usage
 
   cd "$ROOT_DIR"
   ensure_clean_tree
+  ensure_release_state "$version"
   ensure_release_prerequisites
 
   local current_version current_build build
@@ -309,4 +338,6 @@ main() {
   write_cask "$version" "$sha256"
 }
 
-main "$@"
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi

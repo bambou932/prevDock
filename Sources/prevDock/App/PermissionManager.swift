@@ -4,6 +4,18 @@ import CoreGraphics
 
 enum PermissionManager {
     static let didChangeNotification = Notification.Name("PrevDockPermissionsDidChange")
+    private static let statusCache = PermissionStatusCache(
+        unavailableValue: Status(accessibilityGranted: false, screenRecordingGranted: false),
+        probe: {
+            Status(
+                accessibilityGranted: AXIsProcessTrusted(),
+                screenRecordingGranted: CGPreflightScreenCaptureAccess()
+            )
+        },
+        onChange: { status in
+            NotificationCenter.default.post(name: didChangeNotification, object: status)
+        }
+    )
 
     enum Permission: CaseIterable {
         case accessibility
@@ -51,13 +63,16 @@ enum PermissionManager {
     }
 
     static var status: Status {
-        Status(
-            accessibilityGranted: AXIsProcessTrusted(),
-            screenRecordingGranted: CGPreflightScreenCaptureAccess()
-        )
+        statusCache.value
+    }
+
+    @discardableResult
+    static func refreshStatus() -> Status {
+        statusCache.refresh()
     }
 
     static func request(_ permission: Permission) {
+        defer { refreshStatus() }
         switch permission {
         case .accessibility:
             requestAccessibility()

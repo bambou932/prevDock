@@ -5,13 +5,20 @@ This repository is a pure Swift 5 AppKit app. Build and test from the command li
 ## Source Layout
 
 - `Sources/prevDock/App`: app lifecycle, menu bar entry, permission prompts.
-- `Sources/prevDock/Dock`: Dock hit testing, label suppression, inactive-app labels, running-app matching.
+- `Sources/prevDock/Dock`: Dock hit testing, label suppression, running-app matching.
 - `Sources/prevDock/Preview`: preview panels, preview cards, live thumbnail cadence, hover peek UI.
 - `Sources/prevDock/Settings`: user defaults and AppKit settings UI.
 - `Sources/prevDock/Windowing`: window inventory, capture, focus, close, and SkyLight bridges.
 - `Sources/prevDock/Support`: shared helpers that several features depend on.
 
 Keep files near the feature that changes with them. Add a new folder only when a feature has its own lifecycle and likely changes independently.
+
+## Find and Verify a Change
+
+- Start with [ARCHITECTURE.md](ARCHITECTURE.md) for the interaction flow and symptom-to-file map. Read the feature's `README.md` before changing its ownership boundaries.
+- Keep queue/lock ownership, callback order, cancellation generations, preference migration and timing intact during structural refactors. Document a behavior change separately with its reproduction.
+- Run `./scripts/test.sh --list` to find focused suites. `./scripts/build.sh` runs all deterministic suites before building; test source groups are defined once in `scripts/test-sources.sh`.
+- Use [TESTING.md](TESTING.md) for real app verification. Serialize desktop tests so another agent cannot change the pointer, active window or settings during an observation. Restore temporary test preferences and close fixture apps afterward.
 
 ## Coding Rules
 

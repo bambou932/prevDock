@@ -2,9 +2,8 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-DEVELOPER_DIR="${DEVELOPER_DIR:-/Applications/Xcode.app/Contents/Developer}"
-SWIFTC="$DEVELOPER_DIR/Toolchains/XcodeDefault.xctoolchain/usr/bin/swiftc"
-SDKROOT="$DEVELOPER_DIR/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk"
+source "$ROOT_DIR/scripts/swift-toolchain.sh"
+source "$ROOT_DIR/scripts/test-sources.sh"
 PRIVATE_FRAMEWORKS_DIR="$SDKROOT/System/Library/PrivateFrameworks"
 TEST_DIR="$(mktemp -d)"
 trap 'rm -rf "$TEST_DIR"' EXIT
@@ -12,14 +11,14 @@ trap 'rm -rf "$TEST_DIR"' EXIT
 "$SWIFTC" \
   -O \
   -swift-version 5 \
-  -sdk "$SDKROOT" \
+  -sdk "$SDKROOT" -target "$SWIFT_TARGET" \
   -F "$PRIVATE_FRAMEWORKS_DIR" \
   -framework Cocoa \
   -framework ApplicationServices \
   -framework CoreGraphics \
   -framework SkyLight \
   "$ROOT_DIR/Sources/prevDock/Windowing/RemoteWindowElementIDCache.swift" \
-  "$ROOT_DIR/Sources/prevDock/Windowing/RemoteWindowElementResolver.swift" \
+  "${REMOTE_WINDOW_RESOLVER_SOURCES[@]}" \
   "$ROOT_DIR/Tests/RemoteWindowElementResolverLiveTests.swift" \
   -o "$TEST_DIR/remote-window-cache-live-tests"
 

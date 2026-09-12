@@ -32,8 +32,11 @@ func bestTitle(_ element: AXUIElement) -> String {
     .first { !$0.isEmpty } ?? ""
 }
 
-let globalDisplayMaxY = NSScreen.screens.map(\.frame.maxY).max() ?? (NSScreen.main?.frame.height ?? 0)
-let axPoint = CGPoint(x: x, y: globalDisplayMaxY - y)
+let primaryDisplayID = CGMainDisplayID()
+let primaryScreen = NSScreen.screens.first {
+    ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value == primaryDisplayID
+} ?? NSScreen.screens.first
+let axPoint = CGPoint(x: x, y: (primaryScreen?.frame.maxY ?? 0) - y)
 
 guard let dock = NSRunningApplication.runningApplications(withBundleIdentifier: "com.apple.dock").first else {
     fatalError("Dock not found")

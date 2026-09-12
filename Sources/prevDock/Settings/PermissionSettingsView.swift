@@ -5,11 +5,14 @@ final class PermissionSettingsView: NSStackView {
     private static let maximumMonitoringDuration: TimeInterval = 120
     private static let returnMonitoringDuration: TimeInterval = 3
 
-    private let summaryLabel = NSTextField(labelWithString: "")
+    private let summaryLabel = NSTextField(wrappingLabelWithString: "")
+    private let summaryImageView = NSImageView()
     private var lastStatus: PermissionManager.Status?
     private var refreshTimer: Timer?
-    private var monitoringDeadline = Date.distantPast
+    private var monitoringDeadline: TimeInterval = 0
+    private var isPageActive = true
     private var applicationObserver: NSObjectProtocol?
+    private var permissionObserver: NSObjectProtocol?
     private var windowCloseObserver: NSObjectProtocol?
 
     private lazy var accessibilityRow = makePermissionRow(
@@ -25,6 +28,7 @@ final class PermissionSettingsView: NSStackView {
         super.init(frame: .zero)
         configureLayout()
         installApplicationObserver()
+        installPermissionObserver()
         refreshStatus()
     }
 
@@ -35,6 +39,7 @@ final class PermissionSettingsView: NSStackView {
     deinit {
         stopMonitoring()
         removeObserver(applicationObserver)
+        removeObserver(permissionObserver)
         removeObserver(windowCloseObserver)
     }
 
@@ -44,6 +49,15 @@ final class PermissionSettingsView: NSStackView {
     }
 
     func refreshForPresentation() {
+        refreshStatus()
+    }
+
+    func setPageActive(_ active: Bool) {
+        isPageActive = active
+        guard active else {
+            stopMonitoring()
+            return
+        }
         refreshStatus()
     }
 
@@ -70,22 +84,17 @@ final class PermissionSettingsView: NSStackView {
     }
 
     private func makeHeader() -> NSStackView {
-        let title = NSTextField(labelWithString: "Permissions")
-        title.font = .systemFont(ofSize: 13, weight: .semibold)
-
-        let explanation = NSTextField(
-            wrappingLabelWithString: "Both permissions are needed for complete Dock previews. “Screen Recording” is the macOS name for access used to create thumbnails."
-        )
-        explanation.font = .systemFont(ofSize: 12)
-        explanation.textColor = .secondaryLabelColor
-        explanation.maximumNumberOfLines = 2
-
-        summaryLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        summaryLabel.maximumNumberOfLines = 2
-
-        let stack = verticalStack([title, explanation, summaryLabel], spacing: 3)
-        explanation.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
-        summaryLabel.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        summaryLabel.font = .systemFont(ofSize: 12)
+        summaryLabel.textColor = .secondaryLabelColor
+        summaryLabel.maximumNumberOfLines = 0
+        summaryLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        summaryImageView.imageScaling = .scaleProportionallyDown
+        summaryImageView.widthAnchor.constraint(equalToConstant: 18).isActive = true
+        summaryImageView.heightAnchor.constraint(equalToConstant: 18).isActive = true
+        let stack = NSStackView(views: [summaryImageView, summaryLabel])
+        stack.orientation = .horizontal
+        stack.alignment = .centerY
+        stack.spacing = 9
         return stack
     }
 
@@ -95,7 +104,7 @@ final class PermissionSettingsView: NSStackView {
         )
         label.font = .systemFont(ofSize: 11)
         label.textColor = .tertiaryLabelColor
-        label.maximumNumberOfLines = 2
+        label.maximumNumberOfLines = 0
         return label
     }
 
@@ -127,7 +136,10 @@ final class PermissionSettingsView: NSStackView {
     }
 
     private func refreshStatus() {
-        let status = PermissionManager.status
+        refreshStatus(PermissionManager.status)
+    }
+
+    private func refreshStatus(_ status: PermissionManager.Status) {
         if status != lastStatus {
             update(status)
         }
@@ -143,10 +155,6 @@ final class PermissionSettingsView: NSStackView {
         screenRecordingRow.update(granted: status.screenRecordingGranted)
         updateSummary(status)
         if hadPreviousStatus {
-            NotificationCenter.default.post(
-                name: PermissionManager.didChangeNotification,
-                object: status
-            )
             NSAccessibility.post(element: summaryLabel, notification: .valueChanged)
         }
     }
@@ -154,13 +162,19 @@ final class PermissionSettingsView: NSStackView {
     private func updateSummary(_ status: PermissionManager.Status) {
         if status.allGranted {
             summaryLabel.stringValue = "Ready — Accessibility and Screen Recording are granted."
-            summaryLabel.textColor = .systemGreen
+            updateSummarySymbol(granted: true)
             return
         }
 
         let missing = status.missingPermissions.map(\.title).joined(separator: " and ")
         summaryLabel.stringValue = "Action needed — \(missing) \(status.missingPermissions.count == 1 ? "is" : "are") not granted."
-        summaryLabel.textColor = .systemOrange
+        updateSummarySymbol(granted: false)
+    }
+
+    private func updateSummarySymbol(granted: Bool) {
+        let symbol = granted ? "checkmark.circle.fill" : "info.circle.fill"
+        summaryImageView.image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil)
+        summaryImageView.contentTintColor = granted ? .systemGreen : .secondaryLabelColor
     }
 
     private func row(for permission: PermissionManager.Permission) -> PermissionRowView {
@@ -182,10 +196,22 @@ final class PermissionSettingsView: NSStackView {
         }
     }
 
+    private func installPermissionObserver() {
+        permissionObserver = NotificationCenter.default.addObserver(
+            forName: PermissionManager.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let status = notification.object as? PermissionManager.Status else { return }
+            self?.refreshStatus(status)
+        }
+    }
+
     private func applicationDidBecomeActive() {
+        guard isPageActive else { return }
         refreshStatus()
         guard refreshTimer != nil else { return }
-        monitoringDeadline = Date().addingTimeInterval(Self.returnMonitoringDuration)
+        monitoringDeadline = ProcessInfo.processInfo.systemUptime + Self.returnMonitoringDuration
     }
 
     private func observeWindowClose() {
@@ -206,7 +232,8 @@ final class PermissionSettingsView: NSStackView {
     }
 
     private func startMonitoring() {
-        monitoringDeadline = Date().addingTimeInterval(Self.maximumMonitoringDuration)
+        guard isPageActive else { return }
+        monitoringDeadline = ProcessInfo.processInfo.systemUptime + Self.maximumMonitoringDuration
         guard refreshTimer == nil else { return }
 
         let timer = Timer(timeInterval: Self.monitoringInterval, repeats: true) { [weak self] timer in
@@ -214,7 +241,8 @@ final class PermissionSettingsView: NSStackView {
                 timer.invalidate()
                 return
             }
-            guard self.window?.isVisible == true, Date() < self.monitoringDeadline else {
+            guard self.isPageActive, self.window?.isVisible == true,
+                  ProcessInfo.processInfo.systemUptime < self.monitoringDeadline else {
                 self.stopMonitoring()
                 return
             }
@@ -227,7 +255,7 @@ final class PermissionSettingsView: NSStackView {
     private func stopMonitoring() {
         refreshTimer?.invalidate()
         refreshTimer = nil
-        monitoringDeadline = .distantPast
+        monitoringDeadline = 0
     }
 
     private func removeObserver(_ observer: NSObjectProtocol?) {
@@ -235,135 +263,5 @@ final class PermissionSettingsView: NSStackView {
         NotificationCenter.default.removeObserver(observer)
     }
 
-    private func verticalStack(_ views: [NSView], spacing: CGFloat) -> NSStackView {
-        let stack = NSStackView(views: views)
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = spacing
-        return stack
-    }
-}
 
-private final class PermissionRowView: NSStackView {
-    private let permission: PermissionManager.Permission
-    private let statusImageView = NSImageView()
-    private let statusLabel = NSTextField(labelWithString: "")
-    private let requestButton = NSButton(title: "Request Access", target: nil, action: nil)
-    private let settingsButton = NSButton(title: "Open Settings", target: nil, action: nil)
-    private let requestHandler: (PermissionManager.Permission) -> Void
-    private let settingsHandler: (PermissionManager.Permission) -> Void
-
-    init(
-        permission: PermissionManager.Permission,
-        description: String,
-        requestHandler: @escaping (PermissionManager.Permission) -> Void,
-        settingsHandler: @escaping (PermissionManager.Permission) -> Void
-    ) {
-        self.permission = permission
-        self.requestHandler = requestHandler
-        self.settingsHandler = settingsHandler
-        super.init(frame: .zero)
-        configureLayout(description: description)
-    }
-
-    required init?(coder: NSCoder) {
-        fatalError("init(coder:) has not been implemented")
-    }
-
-    func update(granted: Bool) {
-        let shouldMoveKeyboardFocus = granted && window?.firstResponder === requestButton
-        let symbolName = granted ? "checkmark.circle.fill" : "exclamationmark.circle.fill"
-        let color: NSColor = granted ? .systemGreen : .systemOrange
-        statusImageView.image = NSImage(systemSymbolName: symbolName, accessibilityDescription: nil)
-        statusImageView.contentTintColor = color
-        statusLabel.stringValue = granted ? "Granted" : "Needed"
-        statusLabel.textColor = color
-        requestButton.isHidden = granted
-        settingsButton.title = granted ? "Review Settings" : "Open Settings"
-        setAccessibilityValue(granted ? "Granted" : "Not granted")
-        if shouldMoveKeyboardFocus {
-            window?.makeFirstResponder(settingsButton)
-        }
-    }
-
-    func preferredAction(granted: Bool) -> NSButton {
-        granted ? settingsButton : requestButton
-    }
-
-    private func configureLayout(description: String) {
-        orientation = .horizontal
-        alignment = .centerY
-        spacing = 10
-        edgeInsets = NSEdgeInsets(top: 10, left: 12, bottom: 10, right: 12)
-        wantsLayer = true
-        layer?.cornerRadius = 8
-        layer?.backgroundColor = NSColor.controlBackgroundColor.withAlphaComponent(0.6).cgColor
-        layer?.borderColor = NSColor.separatorColor.withAlphaComponent(0.35).cgColor
-        layer?.borderWidth = 1
-
-        let labels = makeLabels(description: description)
-        let spacer = NSView()
-        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
-        spacer.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        configureStatusViews()
-        configureButtons()
-        addArrangedSubview(labels)
-        addArrangedSubview(spacer)
-        addArrangedSubview(makeStatusStack())
-        addArrangedSubview(requestButton)
-        addArrangedSubview(settingsButton)
-        labels.widthAnchor.constraint(greaterThanOrEqualToConstant: 300).isActive = true
-        setAccessibilityLabel(permission.title)
-    }
-
-    private func makeLabels(description: String) -> NSStackView {
-        let title = NSTextField(labelWithString: permission.title)
-        title.font = .systemFont(ofSize: 13, weight: .medium)
-        let detail = NSTextField(wrappingLabelWithString: description)
-        detail.font = .systemFont(ofSize: 11)
-        detail.textColor = .secondaryLabelColor
-        detail.maximumNumberOfLines = 2
-        let stack = NSStackView(views: [title, detail])
-        stack.orientation = .vertical
-        stack.alignment = .leading
-        stack.spacing = 2
-        return stack
-    }
-
-    private func configureStatusViews() {
-        statusImageView.imageScaling = .scaleProportionallyDown
-        statusImageView.setContentHuggingPriority(.required, for: .horizontal)
-        statusImageView.widthAnchor.constraint(equalToConstant: 16).isActive = true
-        statusImageView.heightAnchor.constraint(equalToConstant: 16).isActive = true
-        statusLabel.font = .systemFont(ofSize: 12, weight: .medium)
-        statusLabel.alignment = .left
-        statusLabel.widthAnchor.constraint(equalToConstant: 52).isActive = true
-    }
-
-    private func makeStatusStack() -> NSStackView {
-        let stack = NSStackView(views: [statusImageView, statusLabel])
-        stack.orientation = .horizontal
-        stack.alignment = .centerY
-        stack.spacing = 5
-        return stack
-    }
-
-    private func configureButtons() {
-        requestButton.target = self
-        requestButton.action = #selector(requestAccess)
-        requestButton.bezelStyle = .rounded
-        requestButton.controlSize = .small
-        settingsButton.target = self
-        settingsButton.action = #selector(openSettings)
-        settingsButton.bezelStyle = .rounded
-        settingsButton.controlSize = .small
-    }
-
-    @objc private func requestAccess() {
-        requestHandler(permission)
-    }
-
-    @objc private func openSettings() {
-        settingsHandler(permission)
-    }
 }

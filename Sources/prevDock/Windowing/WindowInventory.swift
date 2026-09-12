@@ -2,65 +2,9 @@ import Cocoa
 import ApplicationServices
 import CoreGraphics
 
-struct WindowPreview {
-    let windowID: CGWindowID
-    let title: String
-    let bounds: CGRect
-    let isMinimized: Bool
-    let isFullscreen: Bool
-    let isFocused: Bool
-    let desktop: WindowDesktop?
-    let image: NSImage?
-    let app: NSRunningApplication
-
-    func replacingImage(with image: NSImage?) -> WindowPreview {
-        WindowPreview(
-            windowID: windowID,
-            title: title,
-            bounds: bounds,
-            isMinimized: isMinimized,
-            isFullscreen: isFullscreen,
-            isFocused: isFocused,
-            desktop: desktop,
-            image: image,
-            app: app
-        )
-    }
-}
-
-struct WindowDesktop: Hashable {
-    let id: UInt64
-    let title: String
-    let sortOrder: Int
-    let isCurrent: Bool
-}
-
-enum WindowThumbnailRefreshPolicy: Int {
-    case none
-    case missingOnly
-    case refreshStale
-}
-
-enum FreshThumbnailCaptureResult {
-    case captured(NSImage)
-    case cached(NSImage)
-    case unavailable
-
-    var image: NSImage? {
-        switch self {
-        case .captured(let image), .cached(let image):
-            return image
-        case .unavailable:
-            return nil
-        }
-    }
-}
-
 enum WindowInventory {
     private static let workQueue = DispatchQueue(label: "prevDock.window-inventory", qos: .userInitiated)
-    private static let actionQueue = DispatchQueue(label: "prevDock.window-actions", qos: .userInteractive)
     private static let cachedPreviewsLock = NSLock()
-    private static let remoteWindowElementResolver = RemoteWindowElementResolver()
     private static let refreshCoordinator = WindowRefreshCoordinator<pid_t, WindowRefreshCallbacks>()
     private static let captureQueue: OperationQueue = {
         let queue = OperationQueue()
@@ -77,9 +21,10 @@ enum WindowInventory {
         return queue
     }()
     private static var previewsByPID = [pid_t: [WindowPreview]]()
+    private static var previewElementsByPID = [pid_t: [CGWindowID: AXUIElement]]()
     private static var cachedPreviewsSnapshotByPID = [pid_t: [WindowPreview]]()
-    private static var cachedMetadataRefreshedAtByPID = [pid_t: Date]()
-    private static var cacheAccessByPID = [pid_t: Date]()
+    private static var cachedMetadataRefreshedAtByPID = [pid_t: TimeInterval]()
+    private static var cacheAccessByPID = [pid_t: TimeInterval]()
     private static var thumbnailsByWindow = [WindowCacheKey: ThumbnailCacheEntry]()
     private static var inFlightCaptures = Set<WindowCaptureRequestKey>()
     // Multiple preview views can ask for the same window image during hover; keep one capture alive.
@@ -96,10 +41,7 @@ enum WindowInventory {
     private static let thumbnailLiveRefreshMinimumAge: TimeInterval = 1.5
     private static let maximumCachedThumbnailPixelDimension = 1200
     private static let maximumCachedApplications = 8
-    private static let axFullScreenAttribute = "AXFullScreen" as CFString
-    private static var focusRestorationObserver: NSObjectProtocol?
-    private static var pendingFocusRestoration: FocusRestoration?
-    private static var focusRestorationGeneration = 0
+    private static let metadataRefreshTimeLimit: TimeInterval = 1.5
     private static let applicationTerminationObserver: NSObjectProtocol = {
         NSWorkspace.shared.notificationCenter.addObserver(
             forName: NSWorkspace.didTerminateApplicationNotification,
@@ -109,20 +51,12 @@ enum WindowInventory {
             guard let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication else {
                 return
             }
-            remoteWindowElementResolver.removeAll(for: app.processIdentifier)
+            WindowDiscovery.removeRemoteWindows(for: app.processIdentifier)
             workQueue.async {
                 purgeCachedApplication(pid: app.processIdentifier)
             }
         }
     }()
-
-    private struct FocusRestoration {
-        let sourceDesktopIDs: Set<UInt64>
-        let targetDesktopIDs: Set<UInt64>
-        let sourceAppPID: pid_t
-        let sourceWindowID: CGWindowID?
-        let targetAppPID: pid_t
-    }
 
     static func cachedWindows(for app: NSRunningApplication) -> [WindowPreview] {
         cachedWindows(for: app, refreshedWithin: nil) ?? []
@@ -143,11 +77,11 @@ enum WindowInventory {
         cachedPreviewsLock.lock()
         let previews = cachedPreviewsSnapshotByPID[app.processIdentifier] ?? []
         let refreshedAt = cachedMetadataRefreshedAtByPID[app.processIdentifier]
-        cacheAccessByPID[app.processIdentifier] = Date()
+        cacheAccessByPID[app.processIdentifier] = ProcessInfo.processInfo.systemUptime
         cachedPreviewsLock.unlock()
         if let maximumAge {
             guard let refreshedAt,
-                  Date().timeIntervalSince(refreshedAt) <= maximumAge else {
+                  (ProcessInfo.processInfo.systemUptime - refreshedAt) <= maximumAge else {
                 return nil
             }
         }
@@ -208,16 +142,26 @@ enum WindowInventory {
         generation: WindowRefreshGeneration<pid_t>
     ) {
         guard refreshCoordinator.begin(generation) else { return }
-        let shouldContinue = { refreshCoordinator.shouldContinue(generation) }
-        guard let refresh = makePreviews(for: app, shouldContinue: shouldContinue),
+        let deadline = ProcessInfo.processInfo.systemUptime + metadataRefreshTimeLimit
+        let shouldContinue = {
+            refreshCoordinator.shouldContinue(generation) &&
+                ProcessInfo.processInfo.systemUptime < deadline
+        }
+        guard let refresh = WindowDiscovery.makePreviews(
+            for: app,
+            previousPreviews: previewsByPID[pid] ?? [],
+            previousElements: previewElementsByPID[pid] ?? [:],
+            cachedImage: { cachedThumbnailImage(pid: pid, windowID: $0, bounds: $1) },
+            shouldContinue: shouldContinue
+        ),
               shouldContinue() else {
-            _ = refreshCoordinator.complete(generation)
+            deliverCachedRefresh(for: app, generation: generation)
             return
         }
         let callbacks = refreshCoordinator.complete(generation)
         guard !callbacks.isEmpty else { return }
         guard !app.isTerminated else {
-            remoteWindowElementResolver.removeAll(for: pid)
+            WindowDiscovery.removeRemoteWindows(for: pid)
             purgeCachedApplication(pid: pid)
             DispatchQueue.main.async {
                 callbacks.forEach { $0.metadata([]) }
@@ -225,11 +169,16 @@ enum WindowInventory {
             return
         }
         let previews = refresh.previews
-        remoteWindowElementResolver.commit(refresh.remoteResolution)
+        WindowDiscovery.commit(refresh.remoteResolution)
         pruneThumbnailCache(for: pid, keeping: previews.map(\.windowID))
 
         previewsByPID[pid] = previews
-        publishCachedPreviews(previews, for: pid, metadataRefreshed: true)
+        previewElementsByPID[pid] = refresh.windowElements
+        publishCachedPreviews(
+            previews,
+            for: pid,
+            metadataRefreshed: refresh.remoteResolution.unresolvedWindowIDs?.isEmpty == true
+        )
         pruneApplicationCachesIfNeeded(keeping: pid)
         let thumbnailPolicy = callbacks
             .map(\.thumbnailPolicy)
@@ -251,92 +200,25 @@ enum WindowInventory {
         }
     }
 
+    private static func deliverCachedRefresh(
+        for app: NSRunningApplication,
+        generation: WindowRefreshGeneration<pid_t>
+    ) {
+        let callbacks = refreshCoordinator.complete(generation)
+        guard !callbacks.isEmpty else { return }
+        let previews = app.isTerminated ? [] : cachedWindows(for: app)
+        DispatchQueue.main.async {
+            let deliverablePreviews = app.isTerminated ? [] : previews
+            callbacks.forEach { $0.metadata(deliverablePreviews) }
+        }
+    }
+
     @discardableResult
     static func warmPreviewCache(
         for app: NSRunningApplication,
         metadata: @escaping ([WindowPreview]) -> Void = { _ in }
     ) -> WindowRefreshRequest {
         refreshWindows(for: app, thumbnailPolicy: .none, metadata: metadata, thumbnail: { _, _ in })
-    }
-
-    private static func makePreviews(
-        for app: NSRunningApplication,
-        shouldContinue: () -> Bool
-    ) -> WindowPreviewRefreshResult? {
-        let pid = app.processIdentifier
-        guard let windowResult = axWindows(for: app, shouldContinue: shouldContinue),
-              shouldContinue() else {
-            return nil
-        }
-        let records = windowResult.records
-        let descriptions = windowDescriptions(records.map(\.windowID))
-        guard shouldContinue() else { return nil }
-        let spaceSnapshot = WindowSpaceSnapshot.current()
-        let focusedWindowID = focusedWindowID(for: pid)
-        guard shouldContinue() else { return nil }
-        let screenRecordingGranted = PermissionManager.status.screenRecordingGranted
-        guard shouldContinue() else { return nil }
-        let previews = records
-            .filter { record in
-                guard let description = descriptions[record.windowID] else { return true }
-                return description.ownerPID == pid
-            }
-            .filter { isDisplayable($0, description: descriptions[$0.windowID], app: app) }
-            .sorted { focusedWindowFirst($0, $1, focusedWindowID: focusedWindowID) }
-            .map {
-                preview(
-                    from: $0,
-                    app: app,
-                    pid: pid,
-                    description: descriptions[$0.windowID],
-                    spaceSnapshot: spaceSnapshot,
-                    focusedWindowID: focusedWindowID,
-                    screenRecordingGranted: screenRecordingGranted
-                )
-            }
-        guard shouldContinue() else { return nil }
-        return WindowPreviewRefreshResult(
-            previews: previews,
-            remoteResolution: windowResult.remoteResolution,
-            screenRecordingGranted: screenRecordingGranted
-        )
-    }
-
-    private static func preview(
-        from record: WindowRecord,
-        app: NSRunningApplication,
-        pid: pid_t,
-        description: WindowDescription?,
-        spaceSnapshot: WindowSpaceSnapshot,
-        focusedWindowID: CGWindowID?,
-        screenRecordingGranted: Bool
-    ) -> WindowPreview {
-        let key = WindowCacheKey(pid: pid, windowID: record.windowID)
-        let size = description?.bounds?.size ?? record.size ?? .zero
-        let position = description?.bounds?.origin ?? record.position ?? .zero
-        let bounds = CGRect(origin: position, size: size)
-        let geometry = WindowCaptureGeometry(bounds)
-        let cachedImage = thumbnailsByWindow[key].flatMap { entry in
-            entry.geometry == geometry ? entry.image : nil
-        }
-        return WindowPreview(
-            windowID: record.windowID,
-            title: previewTitle(for: record, app: app),
-            bounds: bounds,
-            isMinimized: record.isMinimized,
-            isFullscreen: record.isFullscreen,
-            isFocused: record.windowID == focusedWindowID,
-            desktop: spaceSnapshot.desktop(for: record.windowID),
-            image: screenRecordingGranted ? cachedImage : nil,
-            app: app
-        )
-    }
-
-    private static func previewTitle(for record: WindowRecord, app: NSRunningApplication) -> String {
-        if let title = record.title, !title.isEmpty {
-            return title
-        }
-        return app.localizedName ?? "Window"
     }
 
     static func refreshThumbnails(
@@ -396,94 +278,13 @@ enum WindowInventory {
         captureThumbnail(for: preview, mode: .fresh, completion: completion)
     }
 
+    @discardableResult
     static func focusWindow(
         windowID: CGWindowID,
         app: NSRunningApplication,
         completion: @escaping (Bool) -> Void = { _ in }
-    ) {
-        actionQueue.async {
-            guard !app.isTerminated,
-                  let window = axWindowElement(windowID: windowID, app: app) else {
-                completeWindowAction(false, completion: completion)
-                return
-            }
-
-            DispatchQueue.main.async {
-                guard !app.isTerminated else {
-                    completion(false)
-                    return
-                }
-                prepareFocusRestoration(targetWindowID: windowID, targetApp: app)
-                unminimize(window)
-                let focused = applySingleWindowFocus(
-                    to: window,
-                    windowID: windowID,
-                    app: app
-                )
-                if focused {
-                    raiseFocusedWindowIfStillActive(window, windowID: windowID, app: app)
-                }
-                verifyFocusedWindow(
-                    windowID: windowID,
-                    app: app,
-                    requestedFocus: focused,
-                    observedFocusedWindow: false,
-                    attempt: 0,
-                    completion: completion
-                )
-            }
-        }
-    }
-
-    private static func verifyFocusedWindow(
-        windowID: CGWindowID,
-        app: NSRunningApplication,
-        requestedFocus: Bool,
-        observedFocusedWindow: Bool,
-        attempt: Int,
-        completion: @escaping (Bool) -> Void
-    ) {
-        actionQueue.asyncAfter(deadline: .now() + 0.1) {
-            guard !app.isTerminated else {
-                completeWindowAction(false, completion: completion)
-                return
-            }
-            let focusedID = focusedWindowID(for: app.processIdentifier)
-            if focusedID == windowID, app.isActive {
-                completeWindowAction(true, completion: completion)
-                return
-            }
-            let observedFocusedWindow = observedFocusedWindow || focusedID != nil
-            guard attempt < 15 else {
-                let succeededWithoutAXVerification = requestedFocus &&
-                    app.isActive &&
-                    !observedFocusedWindow
-                completeWindowAction(succeededWithoutAXVerification, completion: completion)
-                return
-            }
-            verifyFocusedWindow(
-                windowID: windowID,
-                app: app,
-                requestedFocus: requestedFocus,
-                observedFocusedWindow: observedFocusedWindow,
-                attempt: attempt + 1,
-                completion: completion
-            )
-        }
-    }
-
-    private static func raiseFocusedWindowIfStillActive(
-        _ window: AXUIElement,
-        windowID: CGWindowID,
-        app: NSRunningApplication
-    ) {
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            guard app.isActive,
-                  focusedWindowID(for: app.processIdentifier) == windowID else {
-                return
-            }
-            AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-        }
+    ) -> WindowFocusRequest {
+        WindowCommands.focusWindow(windowID: windowID, app: app, completion: completion)
     }
 
     static func closeWindow(
@@ -492,311 +293,38 @@ enum WindowInventory {
         isFullscreen: Bool = false,
         completion: @escaping (Bool) -> Void
     ) {
-        actionQueue.async {
-            guard let window = axWindowElement(windowID: windowID, app: app) else {
-                completeWindowAction(false, completion: completion)
-                return
-            }
-
-            if isFullscreen,
-               AXUIElementSetAttributeValue(window, axFullScreenAttribute, kCFBooleanFalse) == .success {
-                closeAfterFullscreenExit(
-                    window,
-                    windowID: windowID,
-                    app: app,
-                    attempt: 0,
-                    completion: completion
-                )
-                return
-            }
-            requestCloseAndVerify(window, windowID: windowID, app: app, completion: completion)
-        }
-    }
-
-    private static func closeAfterFullscreenExit(
-        _ window: AXUIElement,
-        windowID: CGWindowID,
-        app: NSRunningApplication,
-        attempt: Int,
-        completion: @escaping (Bool) -> Void
-    ) {
-        let isStillFullscreen = AccessibilityHelpers.boolAttribute(window, axFullScreenAttribute) == true
-        guard isStillFullscreen, attempt < 12 else {
-            requestCloseAndVerify(window, windowID: windowID, app: app, completion: completion)
-            return
-        }
-        actionQueue.asyncAfter(deadline: .now() + 0.15) {
-            closeAfterFullscreenExit(
-                window,
-                windowID: windowID,
-                app: app,
-                attempt: attempt + 1,
-                completion: completion
-            )
-        }
-    }
-
-    private static func requestCloseAndVerify(
-        _ window: AXUIElement,
-        windowID: CGWindowID,
-        app: NSRunningApplication,
-        completion: @escaping (Bool) -> Void
-    ) {
-        requestCloseWithRetry(
-            window,
+        WindowCommands.closeWindow(
             windowID: windowID,
             app: app,
-            attempt: 0,
+            isFullscreen: isFullscreen,
             completion: completion
         )
     }
 
-    private static func requestCloseWithRetry(
-        _ window: AXUIElement,
-        windowID: CGWindowID,
-        app: NSRunningApplication,
-        attempt: Int,
-        completion: @escaping (Bool) -> Void
-    ) {
-        let didRequestClose = requestClose(for: window)
-        guard !didRequestClose, attempt < 2 else {
-            verifyClosed(
-                window,
-                windowID: windowID,
-                app: app,
-                closedObservationCount: 0,
-                attempt: 0,
-                completion: completion
-            )
-            return
-        }
-        actionQueue.asyncAfter(deadline: .now() + 0.1) {
-            requestCloseWithRetry(
-                window,
-                windowID: windowID,
-                app: app,
-                attempt: attempt + 1,
-                completion: completion
-            )
-        }
-    }
-
-    private static func requestClose(for window: AXUIElement) -> Bool {
-        if let closeButton = axElementAttribute(window, kAXCloseButtonAttribute as CFString) {
-            let result = AXUIElementPerformAction(closeButton, kAXPressAction as CFString)
-            if result == .success { return true }
-        }
-
-        return AXUIElementPerformAction(window, "AXClose" as CFString) == .success
-    }
-
-    private static func applyFocus(to window: AXUIElement, appElement: AXUIElement) -> Bool {
-        let frontmost = AXUIElementSetAttributeValue(
-            appElement,
-            kAXFrontmostAttribute as CFString,
-            kCFBooleanTrue
-        )
-        let focusedWindow = AXUIElementSetAttributeValue(
-            appElement,
-            kAXFocusedWindowAttribute as CFString,
-            window
-        )
-        AXUIElementSetAttributeValue(window, kAXMainAttribute as CFString, kCFBooleanTrue)
-        AXUIElementSetAttributeValue(window, kAXFocusedAttribute as CFString, kCFBooleanTrue)
-        let raised = AXUIElementPerformAction(window, kAXRaiseAction as CFString)
-        return frontmost == .success || focusedWindow == .success || raised == .success
-    }
-
-    private static func unminimize(_ window: AXUIElement) {
-        AXUIElementSetAttributeValue(window, kAXMinimizedAttribute as CFString, kCFBooleanFalse)
-    }
-
-    private static func applySingleWindowFocus(
-        to window: AXUIElement,
-        windowID: CGWindowID,
-        app: NSRunningApplication
-    ) -> Bool {
-        if SkyLightCapture.focusWindow(windowID: windowID, pid: app.processIdentifier) {
-            return AXUIElementPerformAction(window, kAXRaiseAction as CFString) == .success || app.isActive
-        }
-        let activated = activate(app)
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
-        return applyFocus(to: window, appElement: appElement) || activated
-    }
-
-    private static func prepareFocusRestoration(targetWindowID: CGWindowID, targetApp: NSRunningApplication) {
-        focusRestorationGeneration += 1
-        let generation = focusRestorationGeneration
-        guard let restoration = focusRestoration(targetWindowID: targetWindowID, targetApp: targetApp) else {
-            pendingFocusRestoration = nil
-            return
-        }
-        pendingFocusRestoration = restoration
-        installFocusRestorationObserver()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 5) {
-            guard focusRestorationGeneration == generation else { return }
-            pendingFocusRestoration = nil
-        }
-    }
-
-    private static func focusRestoration(
-        targetWindowID: CGWindowID,
-        targetApp: NSRunningApplication
-    ) -> FocusRestoration? {
-        guard let sourceApp = NSWorkspace.shared.frontmostApplication,
-              sourceApp.processIdentifier != targetApp.processIdentifier else {
-            return nil
-        }
-        let sourceDesktopIDs = SkyLightCapture.currentDesktopIDs()
-        let targetDesktopIDs = Set(SkyLightCapture.spaceIDs(windowID: targetWindowID))
-        guard !sourceDesktopIDs.isEmpty,
-              !targetDesktopIDs.isEmpty,
-              targetDesktopIDs.isDisjoint(with: sourceDesktopIDs) else {
-            return nil
-        }
-        return FocusRestoration(
-            sourceDesktopIDs: sourceDesktopIDs,
-            targetDesktopIDs: targetDesktopIDs,
-            sourceAppPID: sourceApp.processIdentifier,
-            sourceWindowID: focusedWindowID(for: sourceApp.processIdentifier),
-            targetAppPID: targetApp.processIdentifier
-        )
-    }
-
-    private static func installFocusRestorationObserver() {
-        guard focusRestorationObserver == nil else { return }
-        focusRestorationObserver = NSWorkspace.shared.notificationCenter.addObserver(
-            forName: NSWorkspace.activeSpaceDidChangeNotification,
-            object: nil,
-            queue: .main
-        ) { _ in
-            restoreFocusAfterSpaceChange()
-        }
-    }
-
-    private static func restoreFocusAfterSpaceChange() {
-        guard let restoration = pendingFocusRestoration else { return }
-        let currentDesktopIDs = SkyLightCapture.currentDesktopIDs()
-        guard currentDesktopIDs.isDisjoint(with: restoration.targetDesktopIDs),
-              !currentDesktopIDs.isDisjoint(with: restoration.sourceDesktopIDs) else {
-            return
-        }
-        guard NSWorkspace.shared.frontmostApplication?.processIdentifier == restoration.targetAppPID else {
-            pendingFocusRestoration = nil
-            return
-        }
-        pendingFocusRestoration = nil
-        restoreFocus(restoration)
-    }
-
-    private static func restoreFocus(_ restoration: FocusRestoration) {
-        guard let app = NSRunningApplication(processIdentifier: restoration.sourceAppPID) else { return }
-        guard let windowID = restoration.sourceWindowID else {
-            activate(app)
-            return
-        }
-        actionQueue.async {
-            guard let window = axWindowElement(windowID: windowID, app: app) else {
-                DispatchQueue.main.async { _ = activate(app) }
-                return
-            }
-            DispatchQueue.main.async {
-                if applySingleWindowFocus(to: window, windowID: windowID, app: app) {
-                    raiseFocusedWindowIfStillActive(window, windowID: windowID, app: app)
-                }
-            }
-        }
-    }
-
-    @discardableResult
-    private static func activate(_ app: NSRunningApplication) -> Bool {
-        if #available(macOS 14.0, *) {
-            NSApp.yieldActivation(to: app)
-            return app.activate(from: NSRunningApplication.current, options: [])
-        }
-        return app.activate(options: [])
-    }
-
-    private static func verifyClosed(
-        _ window: AXUIElement,
-        windowID: CGWindowID,
-        app: NSRunningApplication,
-        closedObservationCount: Int,
-        attempt: Int,
-        completion: @escaping (Bool) -> Void
-    ) {
-        actionQueue.asyncAfter(deadline: .now() + 0.15) {
-            let presence = windowPresence(window, windowID: windowID, app: app)
-            if presence == .closed, closedObservationCount >= 1 {
-                markClosed(windowID: windowID, app: app) { completion(true) }
-                return
-            }
-            guard attempt < 8 else {
-                completeWindowAction(false, completion: completion)
-                return
-            }
-            verifyClosed(
-                window,
-                windowID: windowID,
-                app: app,
-                closedObservationCount: presence == .closed ? closedObservationCount + 1 : 0,
-                attempt: attempt + 1,
-                completion: completion
-            )
-        }
-    }
-
-    private static func windowPresence(
-        _ window: AXUIElement,
-        windowID: CGWindowID,
-        app: NSRunningApplication
-    ) -> WindowPresence {
-        guard !app.isTerminated else { return .closed }
-        if let description = windowDescriptions([windowID])[windowID] {
-            return description.ownerPID == app.processIdentifier ? .open : .closed
-        }
-
-        var role: CFTypeRef?
-        let result = AXUIElementCopyAttributeValue(
-            window,
-            kAXRoleAttribute as CFString,
-            &role
-        )
-        switch result {
-        case .success:
-            guard let currentWindowID = self.windowID(for: window) else { return .unknown }
-            return currentWindowID == windowID ? .open : .closed
-        case .invalidUIElement, .noValue:
-            return .closed
-        default:
-            return .unknown
-        }
-    }
-
-    private static func completeWindowAction(
-        _ success: Bool,
-        completion: @escaping (Bool) -> Void
-    ) {
-        DispatchQueue.main.async {
-            completion(success)
-        }
-    }
-
-    private static func markClosed(
+    static func removeClosedWindow(
         windowID: CGWindowID,
         app: NSRunningApplication,
         completion: @escaping () -> Void
     ) {
         let pid = app.processIdentifier
         let key = WindowCacheKey(pid: pid, windowID: windowID)
-        remoteWindowElementResolver.remove(pid: pid, windowID: windowID)
+        WindowDiscovery.removeRemoteWindow(pid: pid, windowID: windowID)
         workQueue.async {
             previewsByPID[pid]?.removeAll { $0.windowID == windowID }
+            previewElementsByPID[pid]?.removeValue(forKey: windowID)
             thumbnailsByWindow.removeValue(forKey: key)
             thumbnailFailureBackoff.recordSuccess(for: key)
             invalidateCapture(for: key)
             publishCachedPreviews(previewsByPID[pid] ?? [], for: pid, metadataRefreshed: true)
             DispatchQueue.main.async(execute: completion)
+        }
+    }
+
+    private static func cachedThumbnailImage(pid: pid_t, windowID: CGWindowID, bounds: CGRect) -> NSImage? {
+        let key = WindowCacheKey(pid: pid, windowID: windowID)
+        let geometry = WindowCaptureGeometry(bounds)
+        return thumbnailsByWindow[key].flatMap { entry in
+            entry.geometry == geometry ? entry.image : nil
         }
     }
 
@@ -833,7 +361,7 @@ enum WindowInventory {
         case .missingOnly:
             return entry.image
         case .staleAfter(let minimumAge):
-            return Date().timeIntervalSince(entry.capturedAt) < minimumAge ? entry.image : nil
+            return (ProcessInfo.processInfo.systemUptime - entry.capturedAt) < minimumAge ? entry.image : nil
         case .fresh:
             return nil
         }
@@ -845,7 +373,6 @@ enum WindowInventory {
     ) -> ThumbnailRefreshPlan {
         guard PermissionManager.status.screenRecordingGranted else { return .empty }
         let now = ProcessInfo.processInfo.systemUptime
-        let captureDate = Date()
         var candidates = [ThumbnailCaptureCandidate]()
         var unavailableWindowIDs = [CGWindowID]()
         for preview in previews {
@@ -867,7 +394,7 @@ enum WindowInventory {
                 isCurrentCaptureRequest($0, for: key, signature: signature)
             }
             let isStale = entry.map {
-                captureDate.timeIntervalSince($0.capturedAt) >= thumbnailLiveRefreshMinimumAge
+                (now - $0.capturedAt) >= thumbnailLiveRefreshMinimumAge
             } ?? false
             let decision = WindowThumbnailAttemptPolicy.decide(
                 hasCachedImage: entry != nil,
@@ -910,21 +437,21 @@ enum WindowInventory {
             pid: rhs.preview.app.processIdentifier,
             windowID: rhs.preview.windowID
         )
-        let lhsDate = captureDate(for: lhs, key: lhsKey)
-        let rhsDate = captureDate(for: rhs, key: rhsKey)
-        if lhsDate != rhsDate { return lhsDate < rhsDate }
+        let lhsTime = captureTime(for: lhs, key: lhsKey)
+        let rhsTime = captureTime(for: rhs, key: rhsKey)
+        if lhsTime != rhsTime { return lhsTime < rhsTime }
         if lhs.preview.isFocused != rhs.preview.isFocused { return lhs.preview.isFocused }
         return lhs.preview.windowID < rhs.preview.windowID
     }
 
-    private static func captureDate(
+    private static func captureTime(
         for candidate: ThumbnailCaptureCandidate,
         key: WindowCacheKey
-    ) -> Date {
+    ) -> TimeInterval {
         let geometry = WindowCaptureGeometry(candidate.preview.bounds)
         guard let entry = thumbnailsByWindow[key],
               entry.geometry == geometry else {
-            return .distantPast
+            return -TimeInterval.infinity
         }
         return entry.capturedAt
     }
@@ -966,13 +493,17 @@ enum WindowInventory {
     private static func publishCachedPreviews(
         _ previews: [WindowPreview],
         for pid: pid_t,
-        metadataRefreshed: Bool = false
+        metadataRefreshed: Bool? = nil
     ) {
         cachedPreviewsLock.lock()
         cachedPreviewsSnapshotByPID[pid] = previews
-        cacheAccessByPID[pid] = Date()
-        if metadataRefreshed {
-            cachedMetadataRefreshedAtByPID[pid] = Date()
+        cacheAccessByPID[pid] = ProcessInfo.processInfo.systemUptime
+        if let metadataRefreshed {
+            if metadataRefreshed {
+                cachedMetadataRefreshedAtByPID[pid] = ProcessInfo.processInfo.systemUptime
+            } else {
+                cachedMetadataRefreshedAtByPID.removeValue(forKey: pid)
+            }
         }
         cachedPreviewsLock.unlock()
     }
@@ -994,7 +525,7 @@ enum WindowInventory {
                     !inFlightCaptures.contains(where: { $0.cacheKey.pid == pid })
             }
             .sorted {
-                accessByPID[$0, default: .distantPast] < accessByPID[$1, default: .distantPast]
+                accessByPID[$0, default: -TimeInterval.infinity] < accessByPID[$1, default: -TimeInterval.infinity]
             }
         let excessCount = previewsByPID.count - maximumCachedApplications
         purgeablePIDs.prefix(excessCount).forEach { purgeCachedApplication(pid: $0) }
@@ -1011,6 +542,7 @@ enum WindowInventory {
         }
         thumbnailFailureBackoff.removeAll { $0.pid == pid }
         previewsByPID.removeValue(forKey: pid)
+        previewElementsByPID.removeValue(forKey: pid)
         cachedPreviewsLock.lock()
         cachedPreviewsSnapshotByPID.removeValue(forKey: pid)
         cachedMetadataRefreshedAtByPID.removeValue(forKey: pid)
@@ -1075,10 +607,10 @@ enum WindowInventory {
                 windowID: preview.windowID,
                 resolution: request.priority.captureResolution
             ) { image in
-                let capturedImage = image?.hasUsableWindowAlpha == true ? image : nil
-                let cachedImage = capturedImage?.downscaled(
-                    maximumPixelDimension: maximumCachedThumbnailPixelDimension
-                )
+                let capturedImage = image.map(WindowThumbnailImage.hasUsableWindowAlpha) == true ? image : nil
+                let cachedImage = capturedImage.map {
+                    WindowThumbnailImage.downscaled($0, maximumPixelDimension: maximumCachedThumbnailPixelDimension)
+                }
                 let deliveredImage = request.priority == .live ? capturedImage : cachedImage
                 workQueue.async {
                     finishThumbnailCapture(
@@ -1137,7 +669,7 @@ enum WindowInventory {
            shouldStoreCapturedImage {
             thumbnailsByWindow[key] = ThumbnailCacheEntry(
                 image: cachedImage,
-                capturedAt: Date(),
+                capturedAt: ProcessInfo.processInfo.systemUptime,
                 geometry: request.geometry,
                 sequence: request.sequence
             )
@@ -1247,269 +779,6 @@ enum WindowInventory {
         }
         return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
     }
-
-    private static func axWindows(
-        for app: NSRunningApplication,
-        shouldContinue: () -> Bool
-    ) -> AXWindowRecordResult? {
-        guard let windowResult = axWindowElements(
-            for: app.processIdentifier,
-            shouldContinue: shouldContinue
-        ) else {
-            return nil
-        }
-        let windows = windowResult.elements
-        var records = [WindowRecord]()
-
-        for window in windows {
-            guard shouldContinue() else { return nil }
-            guard let id = windowID(for: window) else { continue }
-            let title = AccessibilityHelpers.stringAttribute(window, kAXTitleAttribute as CFString)?
-                .trimmingCharacters(in: .whitespacesAndNewlines)
-            let role = AccessibilityHelpers.stringAttribute(window, kAXRoleAttribute as CFString)
-            let subrole = AccessibilityHelpers.stringAttribute(window, kAXSubroleAttribute as CFString)
-            let size = AccessibilityHelpers.sizeAttribute(window, kAXSizeAttribute as CFString)
-            records.append(WindowRecord(
-                windowID: id,
-                title: title,
-                role: role,
-                subrole: subrole,
-                position: AccessibilityHelpers.pointAttribute(window, kAXPositionAttribute as CFString),
-                size: validWindowSize(size),
-                isMinimized: AccessibilityHelpers.boolAttribute(window, kAXMinimizedAttribute as CFString) ?? false,
-                isFullscreen: AccessibilityHelpers.boolAttribute(window, axFullScreenAttribute) ?? false,
-                level: SkyLightCapture.level(windowID: id)
-            ))
-        }
-
-        return AXWindowRecordResult(
-            records: unique(records),
-            remoteResolution: windowResult.remoteResolution
-        )
-    }
-
-    private static func validWindowSize(_ size: CGSize?) -> CGSize? {
-        guard let size, size.width > 0, size.height > 0 else { return nil }
-        return size
-    }
-
-    private static func axWindowElement(windowID: CGWindowID, app: NSRunningApplication) -> AXUIElement? {
-        let appElement = AXUIElementCreateApplication(app.processIdentifier)
-        let windows = AccessibilityHelpers.elementArrayAttribute(appElement, kAXWindowsAttribute as CFString)
-        if let match = windows.first(where: { self.windowID(for: $0) == windowID }) {
-            return match
-        }
-        let knownWindowElements = windows.reduce(into: [CGWindowID: AXUIElement]()) { result, element in
-            guard let windowID = self.windowID(for: element) else { return }
-            result[windowID] = element
-        }
-        guard let resolution = remoteWindowResolution(
-            pid: app.processIdentifier,
-            knownWindowElements: knownWindowElements
-        ) else {
-            return nil
-        }
-        remoteWindowElementResolver.commit(resolution)
-        return resolution.windows.first { self.windowID(for: $0) == windowID }
-    }
-
-    private static func axElementAttribute(_ element: AXUIElement, _ attribute: CFString) -> AXUIElement? {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(element, attribute, &value) == .success else { return nil }
-        guard let value, CFGetTypeID(value) == AXUIElementGetTypeID() else { return nil }
-        return (value as! AXUIElement)
-    }
-
-    private static func axWindowElements(
-        for pid: pid_t,
-        shouldContinue: () -> Bool
-    ) -> AXWindowElementResult? {
-        guard shouldContinue() else { return nil }
-        let appElement = AXUIElementCreateApplication(pid)
-        let axWindows = AccessibilityHelpers.elementArrayAttribute(appElement, kAXWindowsAttribute as CFString)
-        guard shouldContinue() else { return nil }
-        let knownWindowElements = axWindows.reduce(into: [CGWindowID: AXUIElement]()) { result, element in
-            guard let windowID = windowID(for: element) else { return }
-            result[windowID] = element
-        }
-        guard let remoteResolution = remoteWindowResolution(
-            pid: pid,
-            knownWindowElements: knownWindowElements,
-            shouldContinue: shouldContinue
-        ) else {
-            return nil
-        }
-        return AXWindowElementResult(
-            elements: axWindows + remoteResolution.windows,
-            remoteResolution: remoteResolution
-        )
-    }
-
-    private static func remoteWindowResolution(
-        pid: pid_t,
-        knownWindowElements: [CGWindowID: AXUIElement],
-        shouldContinue: () -> Bool = { true }
-    ) -> RemoteWindowElementResolution? {
-        guard shouldContinue() else { return nil }
-        guard let snapshot = bruteForceWindowSnapshot(
-            pid: pid,
-            shouldContinue: shouldContinue
-        ) else {
-            return nil
-        }
-        return remoteWindowElementResolver.resolve(
-            pid: pid,
-            knownWindowIDs: Set(knownWindowElements.keys),
-            knownWindowElements: knownWindowElements,
-            targetWindowIDs: snapshot.targetWindowIDs,
-            shouldContinue: shouldContinue
-        )
-    }
-
-    private static func bruteForceWindowSnapshot(
-        pid: pid_t,
-        shouldContinue: () -> Bool
-    ) -> BruteForceWindowSnapshot? {
-        guard shouldContinue() else { return nil }
-        guard let windows = CGWindowListCopyWindowInfo(
-            [.optionAll, .excludeDesktopElements],
-            kCGNullWindowID
-        ) as? [[String: Any]] else {
-            return BruteForceWindowSnapshot(targetWindowIDs: nil)
-        }
-        var targetWindowIDs = Set<CGWindowID>()
-        for description in windows {
-            guard shouldContinue() else { return nil }
-            guard description[kCGWindowOwnerPID as String] as? pid_t == pid,
-                  let windowID = description[kCGWindowNumber as String] as? CGWindowID else {
-                continue
-            }
-            if isBruteForceTargetWindow(description, pid: pid),
-               isAssignedToUserSpaceOrUnknown(windowID: windowID) {
-                targetWindowIDs.insert(windowID)
-            }
-        }
-        return BruteForceWindowSnapshot(targetWindowIDs: Optional(targetWindowIDs))
-    }
-
-    private static func isBruteForceTargetWindow(_ description: [String: Any], pid: pid_t) -> Bool {
-        guard description[kCGWindowOwnerPID as String] as? pid_t == pid,
-              (description[kCGWindowName as String] as? String)?.isEmpty == false,
-              (description[kCGWindowLayer as String] as? Int ?? 0) <= CGWindowLevelForKey(.floatingWindow) else {
-            return false
-        }
-        let bounds = (description[kCGWindowBounds as String] as? NSDictionary)
-            .flatMap { CGRect(dictionaryRepresentation: $0) } ?? .zero
-        return bounds.width >= 80 && bounds.height >= 60
-    }
-
-    private static func isAssignedToUserSpaceOrUnknown(windowID: CGWindowID) -> Bool {
-        WindowSpaceMembership.isRemoteRecoveryCandidate(
-            spaceIDs: SkyLightCapture.spaceIDsIfAvailable(windowID: windowID)
-        )
-    }
-
-    private static func windowID(for element: AXUIElement) -> CGWindowID? {
-        var id = CGWindowID(0)
-        guard _AXUIElementGetWindow(element, &id) == .success, id != 0 else { return nil }
-        return id
-    }
-
-    private static func focusedWindowID(for pid: pid_t) -> CGWindowID? {
-        let appElement = AXUIElementCreateApplication(pid)
-        guard let focusedWindow = axElementAttribute(appElement, kAXFocusedWindowAttribute as CFString) else {
-            return nil
-        }
-        return windowID(for: focusedWindow)
-    }
-
-    private static func unique(_ records: [WindowRecord]) -> [WindowRecord] {
-        var seen = Set<CGWindowID>()
-        return records.filter { record in
-            if seen.contains(record.windowID) { return false }
-            seen.insert(record.windowID)
-            return true
-        }
-    }
-
-    private static func windowDescriptions(_ ids: [CGWindowID]) -> [CGWindowID: WindowDescription] {
-        guard !ids.isEmpty else { return [:] }
-        let rawIds: CFArray = ids.map { UnsafeRawPointer(bitPattern: UInt($0)) }.withUnsafeBufferPointer {
-            CFArrayCreate(nil, UnsafeMutablePointer(mutating: $0.baseAddress), $0.count, nil)
-        }
-        guard let descriptions = CGWindowListCreateDescriptionFromArray(rawIds) as? [[CFString: Any]] else {
-            return [:]
-        }
-        return descriptions.reduce(into: [CGWindowID: WindowDescription]()) { result, description in
-            guard let windowID = description[kCGWindowNumber] as? CGWindowID,
-                  let ownerPID = description[kCGWindowOwnerPID] as? pid_t else { return }
-            let parsedBounds = (description[kCGWindowBounds] as? NSDictionary)
-                .flatMap { CGRect(dictionaryRepresentation: $0) }
-            let bounds = parsedBounds.flatMap { bounds in
-                bounds.width > 0 && bounds.height > 0 ? bounds : nil
-            }
-            result[windowID] = WindowDescription(
-                ownerPID: ownerPID,
-                bounds: bounds,
-                level: description[kCGWindowLayer] as? CGWindowLevel
-            )
-        }
-    }
-
-    private static func isDisplayable(
-        _ record: WindowRecord,
-        description: WindowDescription?,
-        app: NSRunningApplication
-    ) -> Bool {
-        guard record.role == kAXWindowRole as String else { return false }
-        let size = record.size ?? description?.bounds?.size ?? .zero
-        let level = record.level ?? description?.level ?? CGWindowLevel(0)
-        guard size.width >= 80 &&
-            size.height >= 60 &&
-            level <= CGWindowLevelForKey(.floatingWindow) else {
-            return false
-        }
-
-        return isStandardWindowSubrole(record.subrole) ||
-            isAppSpecificDisplayableWindow(record, app: app, size: size)
-    }
-
-    private static func isStandardWindowSubrole(_ subrole: String?) -> Bool {
-        [
-            kAXStandardWindowSubrole as String,
-            kAXDialogSubrole as String,
-            kAXFloatingWindowSubrole as String
-        ].contains(subrole ?? "")
-    }
-
-    private static func isAppSpecificDisplayableWindow(
-        _ record: WindowRecord,
-        app: NSRunningApplication,
-        size: CGSize
-    ) -> Bool {
-        guard record.subrole == kAXUnknownSubrole as String else { return false }
-        let bundleID = app.bundleIdentifier ?? ""
-        if bundleID.hasPrefix("org.mozilla.firefox") {
-            return size.height > 400
-        }
-        if bundleID.hasPrefix("org.videolan.vlc") {
-            return true
-        }
-        return false
-    }
-
-    private static func oldestWindowFirst(_ lhs: WindowRecord, _ rhs: WindowRecord) -> Bool {
-        lhs.windowID < rhs.windowID
-    }
-
-    private static func focusedWindowFirst(_ lhs: WindowRecord, _ rhs: WindowRecord, focusedWindowID: CGWindowID?) -> Bool {
-        if let focusedWindowID {
-            let lhsFocused = lhs.windowID == focusedWindowID
-            let rhsFocused = rhs.windowID == focusedWindowID
-            if lhsFocused != rhsFocused { return lhsFocused }
-        }
-        return oldestWindowFirst(lhs, rhs)
-    }
 }
 
 private struct WindowCacheKey: Hashable {
@@ -1531,7 +800,7 @@ private struct WindowCaptureRequestKey: Hashable {
 
 private struct ThumbnailCacheEntry {
     let image: NSImage
-    let capturedAt: Date
+    let capturedAt: TimeInterval
     let geometry: WindowCaptureGeometry
     let sequence: UInt64
 }
@@ -1597,124 +866,4 @@ private struct WindowRefreshCallbacks {
     let thumbnailPolicy: WindowThumbnailRefreshPolicy
     let metadata: ([WindowPreview]) -> Void
     let thumbnail: (CGWindowID, NSImage) -> Void
-}
-
-private struct WindowDescription {
-    let ownerPID: pid_t
-    let bounds: CGRect?
-    let level: CGWindowLevel?
-}
-
-private struct BruteForceWindowSnapshot {
-    let targetWindowIDs: Set<CGWindowID>?
-}
-
-private struct AXWindowElementResult {
-    let elements: [AXUIElement]
-    let remoteResolution: RemoteWindowElementResolution
-}
-
-private struct AXWindowRecordResult {
-    let records: [WindowRecord]
-    let remoteResolution: RemoteWindowElementResolution
-}
-
-private struct WindowPreviewRefreshResult {
-    let previews: [WindowPreview]
-    let remoteResolution: RemoteWindowElementResolution
-    let screenRecordingGranted: Bool
-}
-
-private enum WindowPresence: Equatable {
-    case open
-    case closed
-    case unknown
-}
-
-private struct WindowSpaceSnapshot {
-    private let desktopsByID: [UInt64: WindowDesktop]
-
-    static func current() -> WindowSpaceSnapshot {
-        guard PrevDockSettings.previewDesktopGroupingEnabled else {
-            return WindowSpaceSnapshot(desktops: [])
-        }
-        return WindowSpaceSnapshot(desktops: SkyLightCapture.managedDesktopSpaces())
-    }
-
-    init(desktops: [WindowDesktop]) {
-        desktopsByID = Dictionary(uniqueKeysWithValues: desktops.map { ($0.id, $0) })
-    }
-
-    func desktop(for windowID: CGWindowID) -> WindowDesktop? {
-        guard !desktopsByID.isEmpty else { return nil }
-        let desktops = SkyLightCapture.spaceIDs(windowID: windowID).compactMap { desktopsByID[$0] }
-        return desktops.first(where: \.isCurrent) ?? desktops.min { $0.sortOrder < $1.sortOrder }
-    }
-}
-
-private extension NSImage {
-    func downscaled(maximumPixelDimension: Int) -> NSImage {
-        guard maximumPixelDimension > 0,
-              let image = cgImage(forProposedRect: nil, context: nil, hints: nil) else {
-            return self
-        }
-        let largestDimension = max(image.width, image.height)
-        guard largestDimension > maximumPixelDimension else { return self }
-
-        let scale = CGFloat(maximumPixelDimension) / CGFloat(largestDimension)
-        let width = max(1, Int((CGFloat(image.width) * scale).rounded()))
-        let height = max(1, Int((CGFloat(image.height) * scale).rounded()))
-        guard let context = CGContext(
-            data: nil,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: 0,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else {
-            return self
-        }
-        context.interpolationQuality = .high
-        context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        guard let scaledImage = context.makeImage() else { return self }
-        return NSImage(cgImage: scaledImage, size: size)
-    }
-
-    var hasUsableWindowAlpha: Bool {
-        guard let cgImage = cgImage(forProposedRect: nil, context: nil, hints: nil) else { return true }
-        let width = 12
-        let height = 12
-        var pixels = [UInt8](repeating: 0, count: width * height * 4)
-        guard let context = CGContext(
-            data: &pixels,
-            width: width,
-            height: height,
-            bitsPerComponent: 8,
-            bytesPerRow: width * 4,
-            space: CGColorSpaceCreateDeviceRGB(),
-            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
-        ) else { return false }
-        context.interpolationQuality = .low
-        context.draw(cgImage, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-        var alphaTotal = 0
-        for index in stride(from: 0, to: pixels.count, by: 4) {
-            let a = pixels[index + 3]
-            alphaTotal += Int(a)
-        }
-        return alphaTotal >= width * height * 8
-    }
-}
-
-private struct WindowRecord {
-    let windowID: CGWindowID
-    let title: String?
-    let role: String?
-    let subrole: String?
-    let position: CGPoint?
-    let size: CGSize?
-    let isMinimized: Bool
-    let isFullscreen: Bool
-    let level: CGWindowLevel?
 }
