@@ -1,69 +1,10 @@
 import Foundation
 
-enum PreviewOverflowMode: String, CaseIterable {
-    case wrap
-    case scroll
-
-    var title: String {
-        switch self {
-        case .wrap:
-            return "Wrap"
-        case .scroll:
-            return "Scroll"
-        }
-    }
-}
-
-enum PreviewContentSize: String, CaseIterable {
-    case extraSmall
-    case small
-    case regular
-    case large
-    case extraLarge
-
-    var title: String {
-        switch self {
-        case .extraSmall:
-            return "Extra Small"
-        case .small:
-            return "Small"
-        case .regular:
-            return "Regular"
-        case .large:
-            return "Large"
-        case .extraLarge:
-            return "Extra Large"
-        }
-    }
-}
-
-enum PreviewWindowHeight: String, CaseIterable {
-    case extraSmall
-    case small
-    case regular
-    case large
-    case extraLarge
-
-    var title: String {
-        switch self {
-        case .extraSmall:
-            return "Extra Small"
-        case .small:
-            return "Small"
-        case .regular:
-            return "Regular"
-        case .large:
-            return "Large"
-        case .extraLarge:
-            return "Extra Large"
-        }
-    }
-}
-
 enum PrevDockSettings {
     static let didChangeNotification = Notification.Name("PrevDockSettingsDidChange")
     static let previewSwitchDelayKey = "previewSwitchDelay"
     static let previewOverflowModeKey = "previewOverflowMode"
+    static let previewAutoFitEnabledKey = "previewAutoFitEnabled"
     static let previewContentSizeKey = "previewContentSize"
     static let previewWindowHeightKey = "previewWindowHeight"
     static let previewCloseButtonEnabledKey = "previewCloseButtonEnabled"
@@ -76,6 +17,7 @@ enum PrevDockSettings {
     static let permissionSetupShownKey = "permissionSetupShown"
     static let defaultPreviewSwitchDelay: TimeInterval = 0.3
     static let defaultPreviewOverflowMode = PreviewOverflowMode.scroll
+    static let defaultPreviewAutoFitEnabled = true
     static let defaultPreviewContentSize = PreviewContentSize.regular
     static let defaultPreviewWindowHeight = PreviewWindowHeight.regular
     static let defaultPreviewCloseButtonEnabled = true
@@ -85,14 +27,13 @@ enum PrevDockSettings {
     static let previewSwitchDelayRange: ClosedRange<TimeInterval> = 0.0...2.0
 
     static func registerDefaults() {
+        migrateLegacyAutoMode()
         UserDefaults.standard.register(defaults: [
             previewSwitchDelayKey: defaultPreviewSwitchDelay,
-            previewOverflowModeKey: defaultPreviewOverflowMode.rawValue,
             previewContentSizeKey: defaultPreviewContentSize.rawValue,
             previewWindowHeightKey: defaultPreviewWindowHeight.rawValue,
             previewCloseButtonEnabledKey: defaultPreviewCloseButtonEnabled,
             previewDesktopGroupingEnabledKey: defaultPreviewDesktopGroupingEnabled,
-            dockAppClickPreviewEnabledKey: defaultDockAppClickPreviewEnabled,
             nativeDockLabelSuppressionEnabledKey: defaultNativeDockLabelSuppressionEnabled,
             launchAtLoginDefaultAppliedKey: false,
             launchAtLoginDefaultPendingKey: false,
@@ -119,11 +60,25 @@ enum PrevDockSettings {
 
     static var previewOverflowMode: PreviewOverflowMode {
         get {
-            PreviewOverflowMode(rawValue: UserDefaults.standard.string(forKey: previewOverflowModeKey) ?? "") ??
-                defaultPreviewOverflowMode
+            let rawValue = UserDefaults.standard.object(forKey: previewOverflowModeKey) as? String
+            return PreviewOverflowMode(rawValue: rawValue ?? "") ?? defaultPreviewOverflowMode
         }
         set {
-            set(newValue.rawValue, replacing: previewOverflowMode.rawValue, forKey: previewOverflowModeKey)
+            let defaults = UserDefaults.standard
+            let currentRawValue = defaults.object(forKey: previewOverflowModeKey) as? String
+            guard currentRawValue != newValue.rawValue else { return }
+            persistInferredAutoFitPreferenceIfNeeded()
+            defaults.set(newValue.rawValue, forKey: previewOverflowModeKey)
+            postChange(forKey: previewOverflowModeKey)
+        }
+    }
+
+    static var previewAutoFitEnabled: Bool {
+        get {
+            optionalBool(forKey: previewAutoFitEnabledKey) ?? inferredAutoFitPreference
+        }
+        set {
+            set(newValue, replacing: previewAutoFitEnabled, forKey: previewAutoFitEnabledKey)
         }
     }
 
@@ -149,7 +104,7 @@ enum PrevDockSettings {
 
     static var previewCloseButtonEnabled: Bool {
         get {
-            UserDefaults.standard.object(forKey: previewCloseButtonEnabledKey) as? Bool ??
+            optionalBool(forKey: previewCloseButtonEnabledKey) ??
                 defaultPreviewCloseButtonEnabled
         }
         set {
@@ -159,7 +114,7 @@ enum PrevDockSettings {
 
     static var previewDesktopGroupingEnabled: Bool {
         get {
-            UserDefaults.standard.object(forKey: previewDesktopGroupingEnabledKey) as? Bool ??
+            optionalBool(forKey: previewDesktopGroupingEnabledKey) ??
                 defaultPreviewDesktopGroupingEnabled
         }
         set {
@@ -169,10 +124,8 @@ enum PrevDockSettings {
 
     static var dockAppClickPreviewEnabled: Bool {
         get {
-            if let value = persistedBool(forKey: dockAppClickPreviewEnabledKey) {
-                return value
-            }
-            return persistedBool(forKey: legacyDockContextClickPreviewEnabledKey) ??
+            optionalBool(forKey: dockAppClickPreviewEnabledKey) ??
+                optionalBool(forKey: legacyDockContextClickPreviewEnabledKey) ??
                 defaultDockAppClickPreviewEnabled
         }
         set {
@@ -182,7 +135,7 @@ enum PrevDockSettings {
 
     static var nativeDockLabelSuppressionEnabled: Bool {
         get {
-            UserDefaults.standard.object(forKey: nativeDockLabelSuppressionEnabledKey) as? Bool ??
+            optionalBool(forKey: nativeDockLabelSuppressionEnabledKey) ??
                 defaultNativeDockLabelSuppressionEnabled
         }
         set {
@@ -192,7 +145,7 @@ enum PrevDockSettings {
 
     static var launchAtLoginDefaultApplied: Bool {
         get {
-            UserDefaults.standard.object(forKey: launchAtLoginDefaultAppliedKey) as? Bool ?? false
+            optionalBool(forKey: launchAtLoginDefaultAppliedKey) ?? false
         }
         set {
             guard newValue != launchAtLoginDefaultApplied else { return }
@@ -202,7 +155,7 @@ enum PrevDockSettings {
 
     static var permissionSetupShown: Bool {
         get {
-            UserDefaults.standard.object(forKey: permissionSetupShownKey) as? Bool ?? false
+            optionalBool(forKey: permissionSetupShownKey) ?? false
         }
         set {
             guard newValue != permissionSetupShown else { return }
@@ -212,7 +165,7 @@ enum PrevDockSettings {
 
     static var launchAtLoginDefaultPending: Bool {
         get {
-            UserDefaults.standard.object(forKey: launchAtLoginDefaultPendingKey) as? Bool ?? false
+            optionalBool(forKey: launchAtLoginDefaultPendingKey) ?? false
         }
         set {
             guard newValue != launchAtLoginDefaultPending else { return }
@@ -233,17 +186,42 @@ enum PrevDockSettings {
         return min(max(value, previewSwitchDelayRange.lowerBound), previewSwitchDelayRange.upperBound)
     }
 
-    private static func persistedBool(forKey key: String) -> Bool? {
-        guard let bundleID = Bundle.main.bundleIdentifier,
-              let domain = UserDefaults.standard.persistentDomain(forName: bundleID) else {
-            return nil
+    private static func optionalBool(forKey key: String) -> Bool? {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: key) != nil else { return nil }
+        return defaults.bool(forKey: key)
+    }
+
+    private static var inferredAutoFitPreference: Bool {
+        let rawMode = UserDefaults.standard.object(forKey: previewOverflowModeKey) as? String
+        switch rawMode {
+        case PreviewOverflowMode.scroll.rawValue, PreviewOverflowMode.wrap.rawValue:
+            return false
+        default:
+            return defaultPreviewAutoFitEnabled
         }
-        return domain[key] as? Bool
+    }
+
+    private static func migrateLegacyAutoMode() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: previewOverflowModeKey) as? String == "auto" else { return }
+        defaults.set(PreviewOverflowMode.scroll.rawValue, forKey: previewOverflowModeKey)
+        defaults.set(true, forKey: previewAutoFitEnabledKey)
+    }
+
+    private static func persistInferredAutoFitPreferenceIfNeeded() {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: previewAutoFitEnabledKey) == nil else { return }
+        defaults.set(inferredAutoFitPreference, forKey: previewAutoFitEnabledKey)
     }
 
     private static func set<Value: Equatable>(_ value: Value, replacing currentValue: Value, forKey key: String) {
         guard value != currentValue else { return }
         UserDefaults.standard.set(value, forKey: key)
+        postChange(forKey: key)
+    }
+
+    private static func postChange(forKey key: String) {
         NotificationCenter.default.post(name: didChangeNotification, object: key)
     }
 }

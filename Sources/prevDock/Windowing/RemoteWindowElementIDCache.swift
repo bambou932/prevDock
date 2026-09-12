@@ -32,8 +32,11 @@ final class RemoteWindowElementIDCache {
 
         for (windowID, elementID) in candidates {
             guard shouldContinue() else { break }
-            guard let element = elementForID(elementID),
-                  validates(element, windowID) else {
+            let element = elementForID(elementID)
+            guard shouldContinue() else { break }
+            let isValid = element.map { validates($0, windowID) } ?? false
+            guard shouldContinue() else { break }
+            guard let element, isValid else {
                 if evictsRejected {
                     remove(pid: pid, windowID: windowID, ifElementIDEquals: elementID)
                 }

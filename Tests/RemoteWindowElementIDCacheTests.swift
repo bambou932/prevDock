@@ -12,6 +12,8 @@ enum RemoteWindowElementIDCacheTests {
         testAtomicApply()
         testStaleApplyDoesNotOverwriteNewerState()
         testCancelledValidationStopsWithoutEviction()
+        testCancellationDuringLookupPreservesMapping()
+        testCancellationDuringValidationPreservesMapping()
         testCreationFailureRemovesMapping()
         testValidationFailureRemovesMapping()
         testCompareAndRemovePreservesNewerMapping()
@@ -137,6 +139,64 @@ enum RemoteWindowElementIDCacheTests {
 
         expect(resolvedElementIDs == [41], "valid mapping should resolve exactly once")
         expect(elements[100] == "element-41", "valid mapping should return its element")
+    }
+
+    private static func testCancellationDuringLookupPreservesMapping() {
+        let cache = RemoteWindowElementIDCache()
+        cache.record(elementID: 64, pid: 12, windowID: 113)
+        var isActive = true
+        var validationCount = 0
+        var rejectionCount = 0
+        let cancelled = cache.resolve(
+            pid: 12,
+            windowIDs: [113],
+            elementForID: { _ -> UInt64? in
+                isActive = false
+                return nil
+            },
+            validates: { _, _ in
+                validationCount += 1
+                return false
+            },
+            onRejected: { _, _ in rejectionCount += 1 },
+            shouldContinue: { isActive }
+        )
+        let retried = cache.resolve(
+            pid: 12,
+            windowIDs: [113],
+            elementForID: { $0 },
+            validates: { _, _ in true }
+        )
+        expect(cancelled.isEmpty, "a cancelled lookup should not return an element")
+        expect(validationCount == 0, "cancellation after lookup should skip validation")
+        expect(rejectionCount == 0, "cancellation must not reject a cached mapping")
+        expect(retried[113] == 64, "a cancelled lookup should preserve its mapping for the next hover")
+    }
+
+    private static func testCancellationDuringValidationPreservesMapping() {
+        let cache = RemoteWindowElementIDCache()
+        cache.record(elementID: 65, pid: 12, windowID: 114)
+        var isActive = true
+        var rejectionCount = 0
+        _ = cache.resolve(
+            pid: 12,
+            windowIDs: [114],
+            elementForID: { $0 },
+            validates: { _, _ in
+                isActive = false
+                return false
+            },
+            onRejected: { _, _ in rejectionCount += 1 },
+            shouldContinue: { isActive }
+        )
+        let retried = cache.resolve(
+            pid: 12,
+            windowIDs: [114],
+            elementForID: { $0 },
+            validates: { _, _ in true }
+        )
+        expect(rejectionCount == 0, "cancellation during validation must not reject its mapping")
+        expect(retried[114] == 65, "cancellation during validation should preserve its mapping")
     }
 
     private static func testCreationFailureRemovesMapping() {

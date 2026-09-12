@@ -20,7 +20,7 @@ final class WindowPeekController {
     private var liveImageUpdateHandler: ((CGWindowID, NSImage) -> Void)?
 
     var isShowingLivePreview: Bool {
-        isLiveRefreshActive && currentWindowID != nil
+        isLiveRefreshActive && currentWindowID != nil && panel.isVisible
     }
 
     private init() {
@@ -60,32 +60,55 @@ final class WindowPeekController {
     }
 
     func show(preview: WindowPreview) {
-        if preview.isFullscreen {
+        guard !preview.isFullscreen,
+              PermissionManager.status.screenRecordingGranted,
+              let frame = presentationFrame(for: preview) else {
             hide()
             return
         }
-
-        guard !preview.isMinimized,
-              preview.bounds.width >= 80,
-              preview.bounds.height >= 60 else {
-            hide()
+        if preview.isMinimized {
+            showSnapshot(preview, frame: frame)
             return
         }
+        showLivePreview(preview, frame: frame)
+    }
 
+    func updateSnapshot(preview: WindowPreview) {
+        guard preview.isMinimized,
+              currentWindowID == preview.windowID,
+              currentPreview?.isMinimized == true else { return }
+        show(preview: preview)
+    }
+
+    private func presentationFrame(for preview: WindowPreview) -> NSRect? {
+        let bounds = preview.bounds
+        guard bounds.origin.x.isFinite, bounds.origin.y.isFinite,
+              bounds.width.isFinite, bounds.height.isFinite,
+              bounds.width >= 80, bounds.height >= 60 else { return nil }
         let frame = LivePreviewCadence.appKitFrame(fromWindowBounds: preview.bounds)
-        guard frame.width >= 80,
-              frame.height >= 60,
-              ScreenGeometry.screen(containing: frame) != nil else {
-            hide()
+        guard ScreenGeometry.screen(containing: frame) != nil else { return nil }
+        return frame
+    }
+
+    private func showSnapshot(_ preview: WindowPreview, frame: NSRect) {
+        let needsOrdering = needsOrdering(for: preview.windowID)
+        if isLiveRefreshActive || currentPreview?.isMinimized != true || currentWindowID != preview.windowID {
+            stopLiveRefresh()
+        }
+        currentWindowID = preview.windowID
+        currentPreview = preview
+        guard let image = preview.image else {
+            clearVisiblePeek()
             return
         }
+        show(image: image, frame: frame, windowID: preview.windowID, orderFront: needsOrdering)
+    }
 
+    private func showLivePreview(_ preview: WindowPreview, frame: NSRect) {
         let windowChanged = currentWindowID != preview.windowID
         let geometryChanged = currentPreview?.bounds != preview.bounds
-        let needsOrdering = currentWindowID != preview.windowID ||
-            !panel.isVisible ||
-            dimmingPanels.contains { !$0.isVisible }
-        if windowChanged || geometryChanged {
+        let needsOrdering = needsOrdering(for: preview.windowID)
+        if windowChanged || geometryChanged || currentPreview?.isMinimized == true {
             stopLiveRefresh()
             if windowChanged, preview.image == nil {
                 clearVisiblePeek()
@@ -98,6 +121,10 @@ final class WindowPeekController {
         }
 
         startLiveRefreshIfNeeded()
+    }
+
+    private func needsOrdering(for windowID: CGWindowID) -> Bool {
+        currentWindowID != windowID || !panel.isVisible || dimmingPanels.contains { !$0.isVisible }
     }
 
     func hide(windowID: CGWindowID? = nil) {
@@ -122,7 +149,7 @@ final class WindowPeekController {
 
     private func stopLiveRefresh() {
         isLiveRefreshActive = false
-        isLiveRefreshCaptureInFlight = false
+        // A capture cannot be interrupted; its completion starts the latest hover target.
         liveRefreshFailureCount = 0
         liveRefreshGeneration += 1
         liveRefreshWorkItem?.cancel()
@@ -141,48 +168,52 @@ final class WindowPeekController {
         isLiveRefreshCaptureInFlight = true
         WindowInventory.captureFreshThumbnail(for: preview) { [weak self] result in
             DispatchQueue.main.async {
-                guard let self else {
-                    return
-                }
-                self.isLiveRefreshCaptureInFlight = false
-                guard self.isLiveRefreshActive,
-                      self.liveRefreshGeneration == generation,
-                      self.currentWindowID == preview.windowID,
-                      let currentPreview = self.currentPreview else {
-                    return
-                }
-                guard PermissionManager.status.screenRecordingGranted else {
-                    self.liveRefreshFailureCount += 1
-                    self.clearVisiblePeek()
-                    self.scheduleNextLiveRefresh(for: currentPreview)
-                    return
-                }
-                switch result {
-                case .captured(let image):
-                    self.liveRefreshFailureCount = 0
-                    self.show(
-                        image: image,
-                        frame: LivePreviewCadence.appKitFrame(fromWindowBounds: currentPreview.bounds),
-                        windowID: currentPreview.windowID,
-                        orderFront: false
-                    )
-                    self.liveImageUpdateHandler?(currentPreview.windowID, image)
-                case .cached(let image):
-                    self.liveRefreshFailureCount += 1
-                    if !self.panel.isVisible {
-                        self.show(
-                            image: image,
-                            frame: LivePreviewCadence.appKitFrame(fromWindowBounds: currentPreview.bounds),
-                            windowID: currentPreview.windowID,
-                            orderFront: true
-                        )
-                    }
-                case .unavailable:
-                    self.liveRefreshFailureCount += 1
-                }
-                self.scheduleNextLiveRefresh(for: currentPreview)
+                self?.completeLiveRefresh(result, windowID: preview.windowID, generation: generation)
             }
         }
+    }
+
+    private func completeLiveRefresh(_ result: FreshThumbnailCaptureResult, windowID: CGWindowID, generation: Int) {
+        isLiveRefreshCaptureInFlight = false
+        guard isLiveRefreshActive else { return }
+        guard liveRefreshGeneration == generation, currentWindowID == windowID else {
+            refreshCurrentPreview()
+            return
+        }
+        guard let preview = currentPreview else { return }
+        guard PermissionManager.status.screenRecordingGranted else {
+            liveRefreshFailureCount += 1
+            clearVisiblePeek()
+            scheduleNextLiveRefresh(for: preview)
+            return
+        }
+        applyLiveRefresh(result, to: preview)
+        scheduleNextLiveRefresh(for: preview)
+    }
+
+    private func applyLiveRefresh(_ result: FreshThumbnailCaptureResult, to preview: WindowPreview) {
+        switch result {
+        case .captured(let image):
+            liveRefreshFailureCount = 0
+            showLiveImage(image, for: preview, orderFront: false)
+            liveImageUpdateHandler?(preview.windowID, image)
+        case .cached(let image):
+            liveRefreshFailureCount += 1
+            if !panel.isVisible {
+                showLiveImage(image, for: preview, orderFront: true)
+            }
+        case .unavailable:
+            liveRefreshFailureCount += 1
+        }
+    }
+
+    private func showLiveImage(_ image: NSImage, for preview: WindowPreview, orderFront: Bool) {
+        show(
+            image: image,
+            frame: LivePreviewCadence.appKitFrame(fromWindowBounds: preview.bounds),
+            windowID: preview.windowID,
+            orderFront: orderFront
+        )
     }
 
     private func scheduleNextLiveRefresh(for preview: WindowPreview) {

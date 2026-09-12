@@ -76,6 +76,18 @@ enum WindowThumbnailCapturePolicyTests {
             "a cache miss was not admitted"
         )
         expect(
+            decision(hasCachedImage: false, isMinimized: true) == .captureMissing,
+            "a cold minimized window was excluded from capture"
+        )
+        expect(
+            decision(hasCachedImage: false, isMinimized: true, isInFlight: true) == .none,
+            "a minimized capture was scheduled twice"
+        )
+        expect(
+            decision(hasCachedImage: false, isMinimized: true, isBackingOff: true) == .unavailableBackoff,
+            "a failed minimized capture did not end Loading during backoff"
+        )
+        expect(
             decision(hasCachedImage: true, isMinimized: true, isStale: true) == .none,
             "a minimized last-known-good image was refreshed"
         )

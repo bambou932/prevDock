@@ -6,18 +6,14 @@ struct RemoteWindowElementResolution {
     let windows: [AXUIElement]
     let cachedWindowCount: Int
     let scanIterationCount: UInt64
+    let unresolvedWindowIDs: Set<CGWindowID>?
     fileprivate let cacheCommit: RemoteWindowElementCacheCommit?
 }
 
 final class RemoteWindowElementResolver {
     private let elementIDCache = RemoteWindowElementIDCache()
-    private let fallbackScanLimit: UInt64 = 1000
-    private let maximumScanLimit: UInt64 = 20000
-    private let scanPadding: UInt64 = 1000
     private let maximumConcurrentScanCount = 6
-    private let cancellationCheckStride: UInt64 = 16
     private let targetedScanTimeLimit: TimeInterval = 0.35
-    private let knownMappingTimeLimit: TimeInterval = 0.03
     private let prioritizedScanTimeLimit: TimeInterval = 0.10
 
     func resolve(
@@ -41,6 +37,7 @@ final class RemoteWindowElementResolver {
                 windows: [],
                 cachedWindowCount: 0,
                 scanIterationCount: 0,
+                unresolvedWindowIDs: [],
                 cacheCommit: cacheCommit(
                     pid: pid,
                     expectedRevision: expectedCacheRevision,
@@ -54,6 +51,7 @@ final class RemoteWindowElementResolver {
                 windows: [],
                 cachedWindowCount: 0,
                 scanIterationCount: 0,
+                unresolvedWindowIDs: [],
                 cacheCommit: cacheCommit(
                     pid: pid,
                     expectedRevision: expectedCacheRevision,
@@ -78,6 +76,7 @@ final class RemoteWindowElementResolver {
                 windows: windows,
                 cachedWindowCount: cachedElements.count,
                 scanIterationCount: 0,
+                unresolvedWindowIDs: [],
                 cacheCommit: cacheCommit(
                     pid: pid,
                     expectedRevision: expectedCacheRevision,
@@ -146,8 +145,8 @@ final class RemoteWindowElementResolver {
         let elements = elementIDCache.resolve(
             pid: pid,
             windowIDs: targetWindowIDs.subtracting(knownWindowIDs),
-            elementForID: { self.remoteElement(pid: pid, elementID: $0) },
-            validates: { self.isExpectedWindow($0, windowID: $1) },
+            elementForID: { RemoteWindowToken.element(pid: pid, elementID: $0) },
+            validates: { RemoteWindowElementValidation.isExpectedWindow($0, windowID: $1) },
             onRejected: { rejectedElementIDsByWindow[$0] = $1 },
             evictsRejected: false,
             shouldContinue: shouldContinue
@@ -184,21 +183,20 @@ final class RemoteWindowElementResolver {
         knownWindowIDs: Set<CGWindowID>,
         shouldContinue: () -> Bool
     ) -> RemoteWindowElementResolution? {
-        let deadline = Date().addingTimeInterval(0.10)
-        let scanLimit = remoteTokenScanLimit(targetWindowIDs: nil)
-        var remoteToken = baseRemoteToken(pid: pid)
+        let deadline = ProcessInfo.processInfo.systemUptime + 0.10
+        let scanLimit = RemoteWindowScanPlan.tokenScanLimit(targetWindowIDs: nil)
+        var remoteToken = RemoteWindowToken(pid: pid)
         var windows = [AXUIElement]()
         var scanIterationCount: UInt64 = 0
         for elementID in UInt64(0)..<scanLimit {
-            guard Date() < deadline else { break }
+            guard ProcessInfo.processInfo.systemUptime < deadline else { break }
+            guard shouldContinue() else { return nil }
             scanIterationCount += 1
-            if scanIterationCount.isMultiple(of: 64), !shouldContinue() { return nil }
-            setElementID(elementID, in: &remoteToken)
-            guard let element = _AXUIElementCreateWithRemoteToken(remoteToken as CFData)?.takeRetainedValue() else {
+            guard let element = remoteToken.element(for: elementID) else {
                 continue
             }
-            guard isAXWindowElement(element) else { continue }
-            guard let resolvedWindowID = windowID(for: element) else {
+            guard RemoteWindowElementValidation.isAXWindowElement(element) else { continue }
+            guard let resolvedWindowID = RemoteWindowElementValidation.windowID(for: element) else {
                 windows.append(element)
                 continue
             }
@@ -211,6 +209,7 @@ final class RemoteWindowElementResolver {
             windows: windows,
             cachedWindowCount: 0,
             scanIterationCount: scanIterationCount,
+            unresolvedWindowIDs: nil,
             cacheCommit: nil
         )
     }
@@ -225,13 +224,14 @@ final class RemoteWindowElementResolver {
               let expectedCacheRevision = context.expectedCacheRevision else {
             return nil
         }
-        let scanLimit = remoteTokenScanLimit(targetWindowIDs: targetWindowIDs)
+        let scanLimit = RemoteWindowScanPlan.tokenScanLimit(targetWindowIDs: targetWindowIDs)
         let state = ConcurrentRemoteWindowScanState(
             windows: initialWindows,
             missingWindowIDs: missingWindowIDs
         )
-        let prioritizedElementIDs = prioritizedElementIDs(
-            context: context,
+        let prioritizedElementIDs = RemoteWindowScanPlan.prioritizedElementIDs(
+            pid: context.pid,
+            knownWindowElements: context.knownWindowElements,
             missingWindowIDs: missingWindowIDs,
             scanLimit: scanLimit,
             shouldContinue: shouldContinue
@@ -265,6 +265,7 @@ final class RemoteWindowElementResolver {
             windows: result.windows,
             cachedWindowCount: context.cachedWindowIDs.count,
             scanIterationCount: result.scanIterationCount,
+            unresolvedWindowIDs: result.missingWindowIDs,
             cacheCommit: cacheCommit(
                 pid: context.pid,
                 expectedRevision: expectedCacheRevision,
@@ -288,24 +289,23 @@ final class RemoteWindowElementResolver {
         }
         let workerCount = min(maximumConcurrentScanCount, elementIDs.count)
         DispatchQueue.concurrentPerform(iterations: workerCount) { workerIndex in
-            var remoteToken = baseRemoteToken(pid: context.pid)
+            var remoteToken = RemoteWindowToken(pid: context.pid)
             var iterationCount: UInt64 = 0
             for index in stride(from: workerIndex, to: elementIDs.count, by: workerCount) {
-                iterationCount += 1
-                if iterationCount.isMultiple(of: cancellationCheckStride) {
-                    guard shouldContinue(),
-                          !state.isComplete,
-                          ProcessInfo.processInfo.systemUptime < deadline else {
-                        break
-                    }
+                guard shouldContinue(),
+                      !state.isComplete,
+                      ProcessInfo.processInfo.systemUptime < deadline else {
+                    break
                 }
+                iterationCount += 1
                 let elementID = elementIDs[index]
-                setElementID(elementID, in: &remoteToken)
-                guard let element = _AXUIElementCreateWithRemoteToken(remoteToken as CFData)?.takeRetainedValue(),
-                      let resolvedWindowID = windowID(for: element),
+                guard let element = remoteToken.element(for: elementID) else {
+                    continue
+                }
+                guard let resolvedWindowID = RemoteWindowElementValidation.windowID(for: element),
                       targetWindowIDs.contains(resolvedWindowID),
                       !context.knownWindowIDs.contains(resolvedWindowID),
-                      isAXWindowElement(element) else {
+                      RemoteWindowElementValidation.isAXWindowElement(element) else {
                     continue
                 }
                 state.accept(
@@ -317,85 +317,6 @@ final class RemoteWindowElementResolver {
             }
             state.addScanIterations(iterationCount)
         }
-    }
-
-    private func prioritizedElementIDs(
-        context: RemoteWindowScanContext,
-        missingWindowIDs: Set<CGWindowID>,
-        scanLimit: UInt64,
-        shouldContinue: () -> Bool
-    ) -> [UInt64] {
-        let knownMappings = knownElementIDMappings(
-            pid: context.pid,
-            elementsByWindowID: context.knownWindowElements,
-            scanLimit: scanLimit,
-            deadline: ProcessInfo.processInfo.systemUptime + knownMappingTimeLimit,
-            shouldContinue: shouldContinue
-        )
-        guard knownMappings.count >= 2, shouldContinue() else { return [] }
-        let sortedMappings = knownMappings.sorted { $0.windowID < $1.windowID }
-        var prioritized = Set<UInt64>()
-        for windowID in missingWindowIDs {
-            guard let bounds = interpolationBounds(for: windowID, in: sortedMappings) else {
-                continue
-            }
-            let windowSpan = Double(bounds.upper.windowID - bounds.lower.windowID)
-            let ratio = Double(windowID - bounds.lower.windowID) / windowSpan
-            let elementSpan = Double(bounds.upper.elementID) - Double(bounds.lower.elementID)
-            let estimate = Double(bounds.lower.elementID) + ratio * elementSpan
-            guard estimate.isFinite else { continue }
-            let center = min(max(UInt64(max(0, estimate.rounded())), 0), scanLimit - 1)
-            let radius: UInt64 = 1024
-            let lower = center > radius ? center - radius : 0
-            let upper = min(scanLimit, center + radius + 1)
-            prioritized.formUnion(lower..<upper)
-        }
-        return prioritized.sorted()
-    }
-
-    private func knownElementIDMappings(
-        pid: pid_t,
-        elementsByWindowID: [CGWindowID: AXUIElement],
-        scanLimit: UInt64,
-        deadline: TimeInterval,
-        shouldContinue: () -> Bool
-    ) -> [KnownRemoteElementMapping] {
-        guard elementsByWindowID.count >= 2 else { return [] }
-        let elementsByHash = Dictionary(grouping: elementsByWindowID) {
-            CFHash($0.value)
-        }
-        var unresolvedWindowIDs = Set(elementsByWindowID.keys)
-        var mappings = [KnownRemoteElementMapping]()
-        var remoteToken = baseRemoteToken(pid: pid)
-        for elementID in UInt64(0)..<scanLimit {
-            if elementID.isMultiple(of: 64),
-               (!shouldContinue() || ProcessInfo.processInfo.systemUptime >= deadline) {
-                return []
-            }
-            setElementID(elementID, in: &remoteToken)
-            guard let element = _AXUIElementCreateWithRemoteToken(remoteToken as CFData)?.takeRetainedValue(),
-                  let candidates = elementsByHash[CFHash(element)] else {
-                continue
-            }
-            for (windowID, knownElement) in candidates where unresolvedWindowIDs.contains(windowID) {
-                guard CFEqual(element, knownElement) else { continue }
-                unresolvedWindowIDs.remove(windowID)
-                mappings.append(KnownRemoteElementMapping(windowID: windowID, elementID: elementID))
-            }
-            if unresolvedWindowIDs.isEmpty { break }
-        }
-        return mappings
-    }
-
-    private func interpolationBounds(
-        for windowID: CGWindowID,
-        in mappings: [KnownRemoteElementMapping]
-    ) -> (lower: KnownRemoteElementMapping, upper: KnownRemoteElementMapping)? {
-        guard let upperIndex = mappings.firstIndex(where: { $0.windowID > windowID }),
-              upperIndex > mappings.startIndex else {
-            return nil
-        }
-        return (mappings[upperIndex - 1], mappings[upperIndex])
     }
 
     private func cacheCommit(
@@ -421,57 +342,6 @@ final class RemoteWindowElementResolver {
     func removeAll(for pid: pid_t) {
         elementIDCache.removeAll(for: pid)
     }
-
-    private func remoteElement(pid: pid_t, elementID: UInt64) -> AXUIElement? {
-        var remoteToken = baseRemoteToken(pid: pid)
-        setElementID(elementID, in: &remoteToken)
-        return _AXUIElementCreateWithRemoteToken(remoteToken as CFData)?.takeRetainedValue()
-    }
-
-    private func baseRemoteToken(pid: pid_t) -> Data {
-        var remoteToken = Data(count: 20)
-        remoteToken.replaceSubrange(0..<4, with: withUnsafeBytes(of: pid) { Data($0) })
-        remoteToken.replaceSubrange(4..<8, with: withUnsafeBytes(of: Int32(0)) { Data($0) })
-        remoteToken.replaceSubrange(8..<12, with: withUnsafeBytes(of: Int32(0x636f636f)) { Data($0) })
-        return remoteToken
-    }
-
-    private func setElementID(_ elementID: UInt64, in remoteToken: inout Data) {
-        remoteToken.replaceSubrange(12..<20, with: withUnsafeBytes(of: elementID) { Data($0) })
-    }
-
-    private func isExpectedWindow(_ element: AXUIElement, windowID expectedWindowID: CGWindowID) -> Bool {
-        isAXWindowElement(element) && windowID(for: element) == expectedWindowID
-    }
-
-    private func isAXWindowElement(_ element: AXUIElement) -> Bool {
-        var value: CFTypeRef?
-        guard AXUIElementCopyAttributeValue(
-            element,
-            kAXSubroleAttribute as CFString,
-            &value
-        ) == .success else {
-            return false
-        }
-        let subrole = value as? String
-        return [
-            kAXStandardWindowSubrole as String,
-            kAXDialogSubrole as String,
-            kAXFloatingWindowSubrole as String
-        ].contains(subrole ?? "")
-    }
-
-    private func windowID(for element: AXUIElement) -> CGWindowID? {
-        var id = CGWindowID(0)
-        guard _AXUIElementGetWindow(element, &id) == .success, id != 0 else { return nil }
-        return id
-    }
-
-    private func remoteTokenScanLimit(targetWindowIDs: Set<CGWindowID>?) -> UInt64 {
-        guard let maxWindowID = targetWindowIDs?.max() else { return fallbackScanLimit }
-        let paddedLimit = UInt64(maxWindowID) + scanPadding
-        return min(max(fallbackScanLimit, paddedLimit), maximumScanLimit)
-    }
 }
 
 private struct RemoteWindowScanContext {
@@ -484,83 +354,12 @@ private struct RemoteWindowScanContext {
     let rejectedElementIDsByWindow: [CGWindowID: UInt64]
 }
 
-private struct KnownRemoteElementMapping {
-    let windowID: CGWindowID
-    let elementID: UInt64
-}
-
 private struct RemoteWindowElementCacheCommit {
     let pid: pid_t
     let expectedRevision: UInt64
     let retainedWindowIDs: Set<CGWindowID>
     let rejectedElementIDsByWindow: [CGWindowID: UInt64]
     let elementIDsByWindow: [CGWindowID: UInt64]
-}
-
-private struct RemoteWindowElementMapping {
-    let elementID: UInt64
-    let windowID: CGWindowID
-}
-
-private final class ConcurrentRemoteWindowScanState {
-    private let lock = NSLock()
-    private var windows: [AXUIElement]
-    private var missingWindowIDs: Set<CGWindowID>
-    private var pendingMappings = [RemoteWindowElementMapping]()
-    private var scanIterationCount: UInt64 = 0
-
-    init(windows: [AXUIElement], missingWindowIDs: Set<CGWindowID>) {
-        self.windows = windows
-        self.missingWindowIDs = missingWindowIDs
-    }
-
-    var isComplete: Bool {
-        lock.lock()
-        let isComplete = missingWindowIDs.isEmpty
-        lock.unlock()
-        return isComplete
-    }
-
-    func accept(
-        element: AXUIElement,
-        elementID: UInt64,
-        windowID: CGWindowID
-    ) {
-        lock.lock()
-        guard missingWindowIDs.remove(windowID) != nil else {
-            lock.unlock()
-            return
-        }
-        windows.append(element)
-        pendingMappings.append(RemoteWindowElementMapping(
-            elementID: elementID,
-            windowID: windowID
-        ))
-        lock.unlock()
-    }
-
-    func addScanIterations(_ count: UInt64) {
-        lock.lock()
-        scanIterationCount += count
-        lock.unlock()
-    }
-
-    var result: ConcurrentRemoteWindowScanResult {
-        lock.lock()
-        let result = ConcurrentRemoteWindowScanResult(
-            windows: windows,
-            pendingMappings: pendingMappings,
-            scanIterationCount: scanIterationCount
-        )
-        lock.unlock()
-        return result
-    }
-}
-
-private struct ConcurrentRemoteWindowScanResult {
-    let windows: [AXUIElement]
-    let pendingMappings: [RemoteWindowElementMapping]
-    let scanIterationCount: UInt64
 }
 
 private struct ValidatedRemoteElements {

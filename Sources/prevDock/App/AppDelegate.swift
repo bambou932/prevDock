@@ -1,16 +1,17 @@
 import Cocoa
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
-    private static let statusIconHeight: CGFloat = 18
-
-    private var statusItem: NSStatusItem?
-    private var permissionMenuItem: NSMenuItem?
     private let previewController = PreviewPanelController()
-    private let labelController = DockLabelPanelController()
     private let dockMouseEventSuppressor = DockMouseEventSuppressor()
     private let hoverDebugPanelController = HoverDebugPanelController()
-    private let updateController = UpdateController()
+    private lazy var updateController = UpdateController()
     private lazy var settingsWindowController = SettingsWindowController(updateController: updateController)
+    private lazy var statusItemController = StatusItemController(
+        updateController: { [weak self] in self?.updateController },
+        showSettings: { [weak self] in self?.showSettings() },
+        showPermissions: { [weak self] in self?.showPermissions() },
+        toggleHoverDebug: { [weak self] in self?.hoverDebugPanelController.toggle() }
+    )
     private var hoverMonitor: DockHoverMonitor?
     private var settingsObserver: NSObjectProtocol?
     private var permissionObserver: NSObjectProtocol?
@@ -26,17 +27,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         PrevDockSettings.registerDefaults()
         LaunchAtLoginController.applyDefaultIfNeeded(isFreshInstall: isFreshInstall)
         lastPermissionStatus = PermissionManager.status
-        configureStatusItem()
+        statusItemController.install()
         dockMouseEventSuppressor.shouldPassThroughMouseMoved = { [weak self] point in
             self?.previewController.contains(point) == true
         }
         dockMouseEventSuppressor.updateForCurrentSettings()
         installSettingsObserver()
         installPermissionObserver()
-        let monitor = DockHoverMonitor(
-            previewController: previewController,
-            labelController: labelController
-        )
+        let monitor = DockHoverMonitor(previewController: previewController)
         hoverMonitor = monitor
         dockMouseEventSuppressor.onSuppressedMouseMoved = { [weak monitor] in
             monitor?.wakeForSuppressedMouseMoved()
@@ -50,83 +48,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
 
-    private func configureStatusItem() {
-        let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
-        if let button = item.button {
-            button.imagePosition = .imageOnly
-            button.imageScaling = .scaleProportionallyDown
-            if let image = statusIconImage() ?? fallbackStatusIconImage() {
-                button.image = image
-            } else {
-                button.title = "pD"
-            }
-        }
-
-        let menu = NSMenu()
-        menu.addItem(NSMenuItem(title: "prevDock is running", action: nil, keyEquivalent: ""))
-        menu.addItem(NSMenuItem.separator())
-        menu.addItem(NSMenuItem(title: "Settings...", action: #selector(showSettings), keyEquivalent: ","))
-        let updateItem = NSMenuItem(
-            title: "Update Now...",
-            action: #selector(UpdateController.checkForUpdates(_:)),
-            keyEquivalent: ""
-        )
-        updateItem.target = updateController
-        menu.addItem(updateItem)
-        menu.addItem(NSMenuItem(title: "Toggle Hover Debug", action: #selector(toggleHoverDebug), keyEquivalent: "d"))
-        let permissionItem = NSMenuItem(
-            title: permissionMenuItemTitle,
-            action: #selector(showPermissions),
-            keyEquivalent: "p"
-        )
-        permissionMenuItem = permissionItem
-        menu.addItem(permissionItem)
-        menu.addItem(NSMenuItem(title: "Quit prevDock", action: #selector(quit), keyEquivalent: "q"))
-        item.menu = menu
-        statusItem = item
-    }
-
-    private func statusIconImage() -> NSImage? {
-        guard let url = Bundle.main.url(forResource: "prevDock_menubar_Icon", withExtension: "svg"),
-              let image = NSImage(contentsOf: url) else {
-            return nil
-        }
-        return preparedStatusIcon(image)
-    }
-
-    private func fallbackStatusIconImage() -> NSImage? {
-        guard let image = NSImage(systemSymbolName: "rectangle.3.group", accessibilityDescription: "prevDock") else {
-            return nil
-        }
-        return preparedStatusIcon(image)
-    }
-
-    private func preparedStatusIcon(_ image: NSImage) -> NSImage {
-        image.isTemplate = true
-        guard image.size.height > 0 else { return image }
-
-        let aspectRatio = image.size.width / image.size.height
-        image.size = NSSize(width: Self.statusIconHeight * aspectRatio, height: Self.statusIconHeight)
-        return image
-    }
-
-    @objc private func showSettings() {
+    private func showSettings() {
         DispatchQueue.main.async { [weak self] in
             self?.settingsWindowController.showSettings()
         }
     }
 
-    @objc private func showPermissions() {
+    private func showPermissions() {
         PrevDockSettings.permissionSetupShown = true
         settingsWindowController.showPermissionSettings()
-    }
-
-    @objc private func toggleHoverDebug() {
-        hoverDebugPanelController.toggle()
-    }
-
-    @objc private func quit() {
-        NSApp.terminate(nil)
     }
 
     private func showPermissionSetupIfNeeded() {
@@ -186,7 +116,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func handlePermissionStatusChange() {
         let status = PermissionManager.status
-        permissionMenuItem?.title = permissionMenuItemTitle(for: status)
+        statusItemController.updatePermissions(status)
         guard status != lastPermissionStatus else { return }
 
         let previousStatus = lastPermissionStatus
@@ -196,17 +126,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             WindowInventory.discardCachedThumbnails()
         }
         previewController.hide()
-        labelController.hide()
         DockGeometryCache.shared.refreshNow()
         hoverMonitor?.start()
         dockMouseEventSuppressor.updateForCurrentSettings()
-    }
-
-    private var permissionMenuItemTitle: String {
-        permissionMenuItemTitle(for: PermissionManager.status)
-    }
-
-    private func permissionMenuItemTitle(for status: PermissionManager.Status) -> String {
-        status.allGranted ? "Permissions..." : "Permissions Required..."
     }
 }
