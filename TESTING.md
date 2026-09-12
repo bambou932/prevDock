@@ -27,6 +27,8 @@ Run commands from the repository root. Read `AGENTS.md` and the feature map in `
 
 Source groups used by tests live in `scripts/test-sources.sh`. Preserve deliberate stubs: adding all production sources to a test can both duplicate types and accidentally touch user settings or OS services. Keep desktop suites serial, including across agents.
 
+Keep calculated layout bounds strict. Native window frames use logical screen coordinates and may round fractional origins and sizes independently, even on Retina displays. Panel integration checks therefore compare native frames with the requested integral envelope and floor/ceiling size bounds; thumbnail rendering uses the separate backing-pixel scale. A fixed half-point tolerance is not portable between these operations.
+
 See the [interactive fixture guide](Tests/Fixtures/README.md) for settings UI controls and restart steps. Its screen geometry is fixed at launch, login changes always succeed, and System Settings links are simulated. Fixture checks do not cover display changes or real service failures; use the built app for those checks and report untested paths explicitly.
 
 For `--inspect-window-updates`, build `build/prevDock.app` first and wait for

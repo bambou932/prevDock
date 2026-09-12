@@ -520,9 +520,11 @@ private enum PreviewPanelIntegrationTests {
             (.bottom, CGRect(x: screen.frame.midX, y: screen.frame.minY, width: 56, height: 180)),
             (.left, CGRect(x: screen.frame.minX, y: screen.frame.midY, width: 180, height: 56)),
             (.right, CGRect(x: screen.frame.maxX - 180, y: screen.frame.midY, width: 180, height: 56)),
-            (.top, CGRect(x: screen.frame.midX, y: screen.frame.maxY - 180, width: 56, height: 180)),
-            (.bottom, CGRect(x: screen.frame.midX, y: screen.frame.minY, width: 56, height: screen.frame.height * 0.48))
-        ]
+            (.top, CGRect(x: screen.frame.midX, y: screen.frame.maxY - 180, width: 56, height: 180))
+        ] + [0.0, 0.25, 0.5, 0.75].map { fraction in
+            (.bottom, CGRect(x: screen.frame.midX, y: screen.frame.minY, width: 56,
+                             height: screen.frame.height * 0.48 + fraction))
+        }
         for mode in [PreviewOverflowMode.scroll, .wrap] {
             settings[PrevDockSettings.previewOverflowModeKey] = mode.rawValue
             defaults.setVolatileDomain(settings, forName: UserDefaults.argumentDomain)
@@ -541,8 +543,7 @@ private enum PreviewPanelIntegrationTests {
                     visibleFrame: screen.visibleFrame, screenFrame: screen.frame,
                     dockAnchor: anchor, dockEdge: edge
                 )
-                try expect(panel.frame.width <= available.width + 0.5 && panel.frame.height <= available.height + 0.5,
-                           "\(mode) \(edge) preview escaped the available Dock-side area")
+                try verifyManualFrame(panel, previews: previews, anchor: anchor, edge: edge, mode: mode, available: available)
                 let scroll = descendants(of: NSScrollView.self, in: content).first
                 if let previousScroll, let previousWidth, abs(previousWidth - available.width) > 1 {
                     try expect(scroll !== previousScroll, "changed Dock geometry reused stale scroll constraints")
@@ -553,6 +554,31 @@ private enum PreviewPanelIntegrationTests {
                            "manual overflow omitted a window")
             }
             controller.hide()
+        }
+    }
+
+    private static func verifyManualFrame(
+        _ panel: NSWindow, previews: [WindowPreview], anchor: CGRect,
+        edge: PreviewPanelDockEdge, mode: PreviewOverflowMode, available: NSSize
+    ) throws {
+        let layout = PreviewPanelLayout()
+        let measured = layout.measuredSize(
+            previews: previews, app: .current, anchoredTo: anchor,
+            imageHeight: PreviewMetrics.imageHeight(anchoredTo: anchor), overflowMode: mode,
+            desktopGroupingEnabled: PrevDockSettings.previewDesktopGroupingEnabled, autoLayoutPlan: nil
+        )
+        let requested = layout.positionedFrame(width: measured.width, height: measured.height, anchoredTo: anchor)
+        let geometry = "\(mode) \(edge): frame=\(panel.frame), requested=\(requested), available=\(available), scale=\(panel.backingScaleFactor), anchor=\(anchor)"
+        try expect(measured.width <= available.width + 0.0001 && measured.height <= available.height + 0.0001,
+                   "manual layout calculation escaped the available Dock-side area: \(geometry)")
+        // Native window-frame alignment uses logical coordinates, independently of backing pixels.
+        let alignedSize = zip([panel.frame.width, panel.frame.height], [measured.width, measured.height]).allSatisfy {
+            actual, requested in actual >= floor(requested) && actual <= ceil(requested)
+        }
+        try expect(alignedSize && requested.integral.contains(panel.frame),
+                   "native preview escaped the requested logical-point alignment envelope: \(geometry)")
+        if panel.frame.width > available.width + 0.5 || panel.frame.height > available.height + 0.5 {
+            print("INFO native frame alignment: \(geometry)")
         }
     }
 
